@@ -1,0 +1,39 @@
+# sbt / build
+target/
+project/project/
+project/target/
+.metals/
+.bloop/
+.cache/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Logs & outputs générés
+logs/
+out/
+**/_delta_log/
+*.log
+
+# Données locales
+data/
+!data/.gitkeep
+/data/Flights/*
+!/data/Flights/.gitkeep
+
+/data/Weather/*
+!/data/Weather/.gitkeep
+
+metastore_db/
+spark-warehouse/
+
+# Scripts temporaires / archives
+*.tgz
+*.zip
+
+# OS
+.DS_Store
+Thumbs.db

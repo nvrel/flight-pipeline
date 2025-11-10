@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Configuration status="WARN" monitorInterval="60" packages="">
+    <Appenders>
+        <!-- Console lisible -->
+        <Console name="Console" target="SYSTEM_OUT">
+            <PatternLayout pattern="%d{HH:mm:ss.SSS} %-5p [%t] %c{1} - %m%n"/>
+        </Console>
+
+        <!-- Fichier tournant : taille + date -->
+        <RollingFile name="RollingFile"
+                     fileName="logs/flight-pipeline.log"
+                     filePattern="logs/flight-pipeline-%d{yyyy-MM-dd}-%i.log.gz">
+            <PatternLayout pattern="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5p [%t] %c - %m%n"/>
+            <Policies>
+                <TimeBasedTriggeringPolicy/>
+                <SizeBasedTriggeringPolicy size="50 MB"/>
+            </Policies>
+            <DefaultRolloverStrategy max="14"/>
+        </RollingFile>
+    </Appenders>
+
+    <Loggers>
+        <!-- Notre code : niveau INFO par défaut -->
+        <Logger name="flightpipeline" level="info" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+
+        <!-- Baisser le bruit des libs -->
+        <Logger name="org.apache.spark" level="warn" additivity="false">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Logger>
+        <Logger name="org.sparkproject" level="warn"/>
+        <Logger name="org.apache.hadoop" level="warn"/>
+        <Logger name="org.apache.parquet" level="warn"/>
+        <Logger name="akka" level="warn"/>
+
+        <!-- Root : WARN -->
+        <Root level="warn">
+            <AppenderRef ref="Console"/>
+            <AppenderRef ref="RollingFile"/>
+        </Root>
+    </Loggers>
+</Configuration>
