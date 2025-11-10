@@ -19,8 +19,9 @@ out/
 *.log
 
 # Données locales
-data/
-!data/.gitkeep
+/data/*
+!/data/.gitkeep
+
 /data/Flights/*
 !/data/Flights/.gitkeep
 
