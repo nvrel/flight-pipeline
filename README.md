@@ -91,19 +91,21 @@ out/join_intermediate.parquet
 Ajouter ceci à `~/.ssh/config` :
 ```
 Host lamsade
-    HostName ssh.lamsade.dauphine.fr
-    Port 5022
-    User nvrel
-    IdentityFile ~/.ssh/id_ed25519_nvrel
-    IdentitiesOnly yes
-    IdentityAgent none
+  HostName ssh.lamsade.dauphine.fr
+  Port 5022
+  User nvrel
+  IdentityFile ~/.ssh/id_ed25519_nvrel
+  IdentitiesOnly yes
+  IdentityAgent none
 
 Host vmhadoopmaster
-    HostName vmhadoopmaster.srv.lamsade.dauphine.fr
-    User nvrel
-    IdentityFile ~/.ssh/id_ed25519_nvrel
-    IdentitiesOnly yes
-    ProxyJump lamsade
+  HostName vmhadoopmaster.srv.lamsade.dauphine.fr
+  User nvrel
+  IdentityFile ~/.ssh/id_ed25519_nvrel
+  IdentitiesOnly yes
+  IdentityAgent none
+  ProxyCommand ssh -p 5022 -i ~/.ssh/id_ed25519_nvrel -o IdentitiesOnly=yes -W %h:%p nvrel@ssh.lamsade.dauphine.fr
+
 ```
 
 Vérifier :
