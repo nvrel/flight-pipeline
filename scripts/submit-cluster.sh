@@ -6,7 +6,7 @@ set -euo pipefail
 #   FP_EXEC_MEM=8g FP_DRIVER_MEM=4g FP_EXEC_CORES=4 FP_NUM_EXECUTORS=6 bash scripts/submit-cluster.sh join 0
 
 MODE="${1:-all}"
-LAGS="${2:-3}"
+LAGS="${2:-7}"
 
 sbt -no-colors clean assembly
 JAR=$(ls target/scala-2.12/*assembly*.jar | head -n1)

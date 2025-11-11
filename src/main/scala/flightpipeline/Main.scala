@@ -108,15 +108,21 @@ object Main {
 
     if (args.mode == "join" || args.mode == "all") {
       val t1 = System.currentTimeMillis()
-      val joiner = new JoinFlightsWeather(
+      val joiner = new flightpipeline.stage.JoinFlightsWeather(
         spark,
-        paths.flightCleanOut, paths.weatherCleanOut,
-        paths.joinIntermediateOut, paths.joinFlatOut(args.lags),
-        args.windowHours, args.lags
+        paths.flightCleanOut,
+        paths.weatherCleanOut,
+        paths.joinIntermediateOut,
+        paths.joinFlatOut(args.lags),
+        args.windowHours,
+        args.lags
       )
       val out = joiner.run()
-      log.info(s"[join] OK en ${(System.currentTimeMillis()-t1)/1000.0}s (rows=${out.count()})")
+      val n = out.count()
+      log.info(s"[join] Terminé. Intermédiaire rows=$n  (lags=${args.lags})")
+      log.info(s"[join] Durée: ${(System.currentTimeMillis()-t1)/1000.0}s")
     }
+
 
     log.info("=== Fin flight-pipeline ===")
     spark.stop()

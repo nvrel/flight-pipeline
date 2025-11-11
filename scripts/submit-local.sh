@@ -11,7 +11,7 @@ set -euo pipefail
 source "$(dirname "$0")/env-local.sh"
 
 MODE="${1:-all}"
-LAGS="${2:-3}"
+LAGS="${2:-7}"
 MONTH="${3:-}"        # ex: 201201
 
 # 2) Build
