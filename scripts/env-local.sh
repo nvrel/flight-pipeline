@@ -33,3 +33,10 @@ export FP_KRYO_MAXBUF="${FP_KRYO_MAXBUF:-256m}"
 export FP_DELTA_COORD="io.delta:delta-spark_2.12:3.2.0"
 export FP_DELTA_EXT="io.delta.sql.DeltaSparkSessionExtension"
 export FP_DELTA_CAT="org.apache.spark.sql.delta.catalog.DeltaCatalog"
+
+# Force l’UI à écouter sur 127.0.0.1 (utile sous WSL)
+export SPARK_LOCAL_IP=127.0.0.1
+# URL “jolie” dans les logs
+export SPARK_PUBLIC_DNS=localhost
+# Port cible de l’UI (si occupé, mieux vaut laisser Spark auto-incrémenter)
+export FP_UI_PORT=4040

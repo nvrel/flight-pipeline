@@ -118,8 +118,8 @@ object Main {
         args.lags
       )
       val out = joiner.run()
-      val n = out.count()
-      log.info(s"[join] Terminé. Intermédiaire rows=$n  (lags=${args.lags})")
+      //val n = out.count()
+      log.info(s"[join] Terminé (lags=${args.lags})")
       log.info(s"[join] Durée: ${(System.currentTimeMillis()-t1)/1000.0}s")
     }
 

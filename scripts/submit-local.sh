@@ -24,6 +24,7 @@ mkdir -p "$FP_LOCAL_DIR" logs
 spark-submit \
   --class flightpipeline.Main \
   --master "local[${FP_LOCAL_CORES}]" \
+  --conf "spark.ui.port=${FP_UI_PORT:-4040}" \
   --packages "${FP_DELTA_COORD}" \
   --driver-memory "${FP_DRIVER_MEM}" \
   --conf "spark.executor.memory=${FP_EXEC_MEM}" \

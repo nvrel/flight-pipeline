@@ -1,26 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd "$(dirname "$0")/.."
 
-echo "[clean-local] Stopping any local Spark shells… (if any open)"
+echo "[clean-local] Dropping any local SQL objects (ignore errors if none)…"
 
-/usr/bin/env pkill -f 'org.apache.spark.deploy' || true
+# Drop tables si la base existe
+spark-sql -S -e "SHOW DATABASES LIKE 'flight_project';" | grep -q "^flight_project$" && {
+  echo "[clean-local] - Dropping tables from flight_project"
+  spark-sql -S -e "DROP TABLE IF EXISTS flight_project.flight_clean"
+  spark-sql -S -e "DROP TABLE IF EXISTS flight_project.weather_clean"
+  spark-sql -S -e "DROP TABLE IF EXISTS flight_project.airport_timezone_clean"
+  spark-sql -S -e "DROP TABLE IF EXISTS flight_project.joined_data"
+}
 
-echo "[clean-local] Dropping any local SQL tables (ignore errors if none)…"
-spark-shell --master local[2] \
-  --packages io.delta:delta-spark_2.12:3.2.0 \
-  --conf spark.sql.extensions=io.delta.sql.DeltaSparkSessionExtension \
-  --conf spark.sql.catalog.spark_catalog=org.apache.spark.sql.delta.catalog.DeltaCatalog \
-  <<'SCALA'
-spark.conf.set("spark.sql.catalogImplementation","in-memory")
-spark.sql("DROP TABLE IF EXISTS flight_project.flight_clean")
-spark.sql("DROP TABLE IF EXISTS flight_project.weather_clean")
-spark.sql("DROP TABLE IF EXISTS flight_project.airport_timezone_clean")
-spark.sql("DROP DATABASE IF NOT EXISTS flight_project CASCADE")
-System.exit(0)
-SCALA
+# Drop database (syntaxe correcte : IF EXISTS)
+echo "[clean-local] - Dropping database flight_project (if exists)"
+spark-sql -S -e "DROP DATABASE IF EXISTS flight_project CASCADE"
 
 echo "[clean-local] Removing generated data and work dirs…"
-rm -rf out out-sample spark-warehouse metastore metastore_db logs target derby.log || true
+rm -rf out/ metastore_db/ spark-warehouse/ derby.log target/
 
 echo "[clean-local] Done."

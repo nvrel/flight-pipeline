@@ -38,3 +38,4 @@ spark-warehouse/
 # OS
 .DS_Store
 Thumbs.db
+.git.BAK*
