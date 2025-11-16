@@ -2,25 +2,123 @@
 set -euo pipefail
 
 # scripts/submit-local.sh
-# Usage (exemples) :
-#   bash scripts/submit-local.sh                     # mode=all, lags=3 (defaults application.conf)
-#   bash scripts/submit-local.sh join 0              # mode=join, lags=0
-#   FP_LOCAL_CORES=8 bash scripts/submit-local.sh    # override ponctuel
+# Usage "classique" (pipeline Spark) :
+#   bash scripts/submit-local.sh                      # mode=all, lags=7
+#   bash scripts/submit-local.sh join 0               # mode=join, lags=0
+#   FP_LOCAL_CORES=8 bash scripts/submit-local.sh     # override ponctuel
+#
+# Mode de restitution :
+#   bash scripts/submit-local.sh show-runs            # affiche les derniers runs
+#   bash scripts/submit-local.sh show-runs 100        # affiche les 100 derniers runs
 
 # 1) Paramètres locaux centralisés
 source "$(dirname "$0")/env-local.sh"
 
-MODE="${1:-all}"
-LAGS="${2:-7}"
-MONTH="${3:-}"        # ex: 201201
+: "${FP_OUT_ROOT:=out}"
 
-# 2) Build
+CMD="${1:-}"   # "all", "prepare", "join", "training", "train", "quality", "report", "show-runs"
+
+# ---------------------------------------------------------------------------
+# 2) Mode spécial : restitution des runs d'entraînement
+# ---------------------------------------------------------------------------
+if [[ "$CMD" == "show-runs" ]]; then
+  shift || true
+  SHOW_LIMIT="${1:-50}"
+
+  export FP_OUT_ROOT
+  export FP_SHOW_LIMIT="$SHOW_LIMIT"
+
+  "$SPARK_HOME/bin/spark-shell" \
+    --master "local[${FP_LOCAL_CORES}]" \
+    --driver-memory "${FP_DRIVER_MEM}" \
+    --packages "${FP_DELTA_COORD}" \
+    --conf "spark.sql.extensions=${FP_DELTA_EXT}" \
+    --conf "spark.sql.catalog.spark_catalog=${FP_DELTA_CAT}" <<'EOF'
+
+import org.apache.spark.sql.functions._
+
+val outRoot   = sys.env.getOrElse("FP_OUT_ROOT", "out")
+val limit     = sys.env.getOrElse("FP_SHOW_LIMIT", "50").toInt
+val path      = s"$outRoot/metrics/train_runs"
+
+val runs = spark.read.format("delta").load(path)
+
+val display = runs
+  .orderBy(col("ts").desc)
+  .select(
+    col("ts"),
+    col("location"),
+    col("dataset_id"),
+    col("delay_threshold_min"),
+    col("lags"),
+    col("window_hours"),
+    col("n_train"),
+    col("n_test"),
+    col("test_accuracy"),
+    col("test_recall_pos").alias("Recd"),
+    col("test_specificity").alias("Reco"),
+    col("comment")
+  )
+
+display.show(limit, truncate = false)
+
+sys.exit(0)
+EOF
+
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 3) Mode "normal" : exécution du pipeline Spark
+# ---------------------------------------------------------------------------
+
+MODE="${CMD:-all}"    # si aucun argument → "all"
+LAGS="${2:-7}"
+MONTH="${3:-}"        # ex : 201201
+
+# Normalisation : "train" → "training"
+case "$MODE" in
+  train)
+    MODE="training"
+    ;;
+esac
+
+# 3.1) Build
 sbt -no-colors clean assembly
 JAR=$(ls target/scala-2.12/*assembly*.jar | head -n1)
 
 mkdir -p "$FP_LOCAL_DIR" logs
 
-# 3) Run
+# 3.2) Informations Git pour le logger d'entraînement
+GIT_COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+if git diff --quiet --ignore-submodules HEAD 2>/dev/null; then
+  GIT_DIRTY="false"
+else
+  GIT_DIRTY="true"
+fi
+
+export FP_ENV_LOCATION="local"
+export FP_GIT_COMMIT="$GIT_COMMIT"
+export FP_GIT_DIRTY="$GIT_DIRTY"
+export FP_OUT_ROOT
+
+# 3.3) Construction de la liste d’arguments Scala
+CLI_ARGS=(
+  --mode "$MODE"
+  --flights "data/Flights"
+  --weather "data/Weather"
+  --airport "data/wban_airport_timezone.csv"
+  --out "$FP_OUT_ROOT"
+  --hours 12
+  --delay-threshold-min 60
+  --lags "$LAGS"
+)
+
+if [[ -n "$MONTH" ]]; then
+  CLI_ARGS+=(--sample-month "$MONTH")
+fi
+
+# 3.4) Lancement du pipeline
 spark-submit \
   --class flightpipeline.Main \
   --master "local[${FP_LOCAL_CORES}]" \
@@ -43,12 +141,5 @@ spark-submit \
   --driver-java-options "${FP_DRIVER_JAVA_OPTS}" \
   --conf "spark.executor.extraJavaOptions=${FP_EXEC_JAVA_OPTS}" \
   "$JAR" \
-  --mode="${MODE}" \
-  --flights="data/Flights" \
-  --weather="data/Weather" \
-  --airport="data/wban_airport_timezone.csv" \
-  --out="out" \
-  --hours=12 \
-  --lags="${LAGS}" \
-  ${MONTH:+--sample-month=${MONTH}} \
+  "${CLI_ARGS[@]}" \
   2>&1 | tee "logs/run_${MODE}_lags${LAGS}_local${MONTH:+_${MONTH}}.log"

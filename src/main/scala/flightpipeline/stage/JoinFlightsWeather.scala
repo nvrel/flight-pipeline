@@ -1,138 +1,293 @@
 package flightpipeline.stage
 
-import org.apache.spark.sql.{DataFrame, SparkSession, Column}
-import org.apache.spark.sql.functions._
+import flightpipeline.util.{ProgressListener, UiLogger}
+import org.apache.spark.sql.{Column, DataFrame, SparkSession}
 import org.apache.spark.sql.expressions.Window
-import org.apache.spark.sql.types.{ArrayType, StructType, NumericType}
+import org.apache.spark.sql.functions._
 import org.apache.spark.storage.StorageLevel
 import org.slf4j.LoggerFactory
-import flightpipeline.util.{ProgressListener, UiLogger}
 
+/**
+ * Jointure vols / météo inspirée de Belcastro et al., TIST 2010
+ * "Using Scalable Data Mining for Predicting Flight Delays".
+ *
+ * Objectif principal (cf. article, sections 2.2–2.3) :
+ *   - pour chaque vol Fs = <Ao, Ad, tsd, tsa>,
+ *   - construire deux tableaux :
+ *       Wo = <O(Ao, tsd), O(Ao, tsd − 1h), …>
+ *       Wd = <D(Ad, tsa), D(Ad, tsa − 1h), …>
+ *   - ces tableaux contiennent les mesures météo observées aux
+ *     aéroports d’origine et de destination, dans une fenêtre
+ *     temporelle finie avant le départ / l’arrivée.
+ *
+ * Dans cette implémentation :
+ *   - Wo et Wd sont stockés dans deux colonnes
+ *       weather_origin, weather_dest
+ *     de type array<struct<w_ts, … variables météo …>>,
+ *   - les éléments sont triés du plus récent au plus ancien,
+ *     ce qui correspond à l’ordre décrit dans l’article,
+ *   - la profondeur temporelle (fenêtre et nombre de lags) est
+ *     paramétrable via `windowHours` et `lags`.
+ *
+ * Sortie principale : une table Delta `join_intermediate` qui sert
+ * de base à la construction des ensembles D1..D4 et à l’entraînement.
+ */
 final class JoinFlightsWeather(
                                 spark: SparkSession,
                                 flightCleanPath: String,
                                 weatherCleanPath: String,
                                 outIntermediate: String,
-                                outFlat: String,              // conservé pour compatibilité d'API, non utilisé
+                                outFlat: String,   // conservé pour un éventuel bloc "flat", désactivé
                                 windowHours: Int,
                                 lags: Int
                               ) {
 
   private val log = LoggerFactory.getLogger(getClass)
 
-  /** Sélectionne les colonnes météo utiles + renomme (AirportId -> apt_id, timestamp -> w_ts). */
+  /**
+   * Sélection des colonnes météo utiles.
+   *
+   * Hypothèses sur `weatherRaw` :
+   *   - contient une colonne temporelle déjà renommée en `w_ts`
+   *   - contient une colonne `AirportId` (clé aéroport).
+   *
+   * Cf. article, section 3 ("Data Understanding") :
+   *   les auteurs retiennent surtout des variables thermiques,
+   *   de pression, de vent, de visibilité, de précipitation et des
+   *   indicateurs de phénomènes (RA, SN, FG, TS, …).
+   *   La liste ci‑dessous suit cette logique en conservant les
+   *   variables dérivées construites dans `WeatherRawToClean`.
+   *
+   * Retour :
+   *   - DataFrame avec schéma :
+   *       apt_id : ID aéroport
+   *       w_ts   : timestamp météo
+   *       …      : variables météo numériques / booléennes
+   *   - liste des colonnes de features météo (hors apt_id et w_ts)
+   */
   private def selectWeatherColumns(weatherRaw: DataFrame): (DataFrame, Seq[String]) = {
+    // Élimination d’un éventuel struct intermédiaire `weather_scores`
+    // pour éviter les ambigüités de nom de colonnes.
     val base0 =
       if (weatherRaw.columns.contains("weather_scores")) weatherRaw.drop("weather_scores")
       else weatherRaw
 
+    // Colonnes météo retenues, en cohérence avec les familles de
+    // variables utilisées dans l’article.
     val keep = Seq(
-      "timestamp", // -> w_ts
-      // thermiques & humidité & pression
-      "DryBulbFarenheit","WetBulbFarenheit","DewPointFarenheit","RelativeHumidity",
-      "SeaLevelPressure","StationPressure","Altimeter",
-      // vent / visibilité / précip / dynamique pression
-      "WindSpeed","WindDirection","ValueForWindCharacter","Visibility","HourlyPrecip","PressureTendency","PressureChange",
-      // nuages & convection
-      "sky_num_layers","sky_min_altitude","sky_max_altitude","sky_mean_altitude",
-      "sky_has_CB","sky_has_TCU","sky_has_OVC","sky_has_BKN","sky_has_SCT","sky_has_FEW","sky_has_VV",
-      // phénomènes (pondérés)
-      "wt_score_RA","wt_score_TS","wt_score_FG","wt_score_BR","wt_score_FZ","wt_score_SN","wt_score_SH","wt_score_DZ"
+      "w_ts", // timestamp météo (pivot pour l’ordre Wo / Wd)
+
+      // Température / humidité / pression
+      "DryBulbFarenheit", "WetBulbFarenheit", "DewPointFarenheit",
+      "RelativeHumidity",
+      "SeaLevelPressure", "StationPressure", "Altimeter",
+
+      // Vent / visibilité / précipitations / dynamique de pression
+      "WindSpeed", "WindDirection", "ValueForWindCharacter",
+      "Visibility", "HourlyPrecip",
+      "PressureTendency", "PressureChange",
+
+      // Géométrie des couches nuageuses. L’article reste assez
+      // succinct sur ce point ; ces indicateurs offrent une
+      // description plus riche de la couverture nuageuse.
+      "sky_num_layers", "sky_min_altitude", "sky_max_altitude", "sky_mean_altitude",
+      "sky_has_CB", "sky_has_TCU",
+      "sky_has_OVC", "sky_has_BKN", "sky_has_SCT",
+      "sky_has_FEW", "sky_has_VV",
+
+      // Scores pondérés par type de phénomène météo.
+      // L’article insiste en particulier sur la pluie (RA),
+      // les orages (TS), le brouillard (FG), la neige (SN),
+      // le verglas (FZ) et les averses (SH).
+      "wt_score_RA", "wt_score_TS", "wt_score_FG", "wt_score_BR",
+      "wt_score_FZ", "wt_score_SN", "wt_score_SH", "wt_score_DZ"
     ).filter(base0.columns.contains)
 
-    val selected = base0.select(
-      col("AirportId").alias("apt_id") +:
-        keep.map {
-          case "timestamp" => col("timestamp").alias("w_ts")
-          case other       => col(other)
-        }: _*
-    )
+    val selectedCols: Seq[Column] =
+      Seq(col("AirportId").alias("apt_id")) ++ keep.map(col)
 
-    val featureCols = selected.columns.filterNot(c => c == "apt_id" || c == "w_ts")
+    val selected = base0.select(selectedCols: _*)
+
+    val featureCols =
+      selected.columns.filterNot(c => c == "apt_id" || c == "w_ts")
+
     (selected, featureCols)
   }
 
+  /**
+   * Point d’entrée principal de l’étape de jointure.
+   *
+   * Étapes principales :
+   *   1. Chargement des vols propres (flight_clean) et calcul du
+   *      timestamp d’arrivée théorique.
+   *   2. Détermination des bornes temporelles nécessaires pour la météo.
+   *   3. Chargement de la météo (weather_clean) filtrée sur cette fenêtre,
+   *      renommage du timestamp en `w_ts`, sélection des variables utiles.
+   *   4. Jointure avec la météo d’origine (Wo), puis de destination (Wd),
+   *      en respectant la fenêtre temporelle décrite dans l’article.
+   *   5. Écriture de la table Delta `join_intermediate`.
+   */
   def run(): DataFrame = {
-    log.info(s"[Join] flights=$flightCleanPath ; weather=$weatherCleanPath ; hours=$windowHours ; lags=$lags")
+    log.info(
+      s"[Join] flights=$flightCleanPath ; weather=$weatherCleanPath ; " +
+        s"hours=$windowHours ; lags=$lags"
+    )
 
-    // (2) Réglages d'exécution : AQE & coalesce partitions & skew join
+    // Réglages d’exécution Spark : AQE, coalescing dynamique, skew join.
+    // Ces optimisations ne sont pas détaillées dans l’article mais
+    // améliorent la robustesse de l’implémentation sur de gros volumes.
     spark.conf.set("spark.sql.adaptive.enabled", "true")
     spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
     spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
-
-    // (3) Granularité fichiers (n'affecte pas les données)
     spark.conf.set("spark.sql.files.maxRecordsPerFile", "5000000")
 
-    // progression / nommage des jobs (UI & logs)
     val sc = spark.sparkContext
     sc.setJobGroup("JOIN-FLW", s"Join flights-weather (lags=$lags, window=$windowHours)")
-    sc.setJobDescription(s"Init join (lags=$lags)")
+    sc.setJobDescription("Initialisation de la jointure vols‑météo")
+
     val uiUrl = UiLogger.logUiUrl(spark)
-    println(s"[ui] ouvrir dans Windows: wslview $uiUrl")
+    println(s"[ui] ouverture de l’UI Spark possible avec : wslview $uiUrl")
     val _listener = ProgressListener.register(sc, 2000L)
 
     var wSelAllPersisted: Option[DataFrame] = None
     var flightsPersisted: Option[DataFrame] = None
 
+    // Par symétrie avec l’article, l’algorithme s’exprime plus clairement
+    // avec un nombre de lags ≥ 1.
+    val effectiveLags: Int = math.max(1, lags)
+
     try {
-      // 1) VOL : colonnes nécessaires + timestamps
-      sc.setJobDescription("Prepare flights (select, timestamps, repartition)")
+      // ------------------------------------------------------------------
+      // 1) Vols : colonnes nécessaires et timestamps
+      //
+      // Référence article : définition de Fs = <Ao, Ad, tsd, tsa>
+      //   - Ao / Ad : ORIGIN_AIRPORT_ID, DEST_AIRPORT_ID
+      //   - tsd     : CRS_DEP_TIMESTAMP
+      //   - tsa     : CRS_ARR_TIMESTAMP (reconstruit)
+      // ------------------------------------------------------------------
+      sc.setJobDescription("Chargement et préparation des vols (flight_clean)")
+
       val flightsSrc = spark.read.format("delta").load(flightCleanPath)
 
+      // Colonnes strictement nécessaires pour :
+      //  - la jointure avec la météo,
+      //  - la définition du label "retard ≥ seuil",
+      //  - la reconstruction des ensembles D1–D4 (section 4.2) qui
+      //    distinguent les retards « météo » des autres causes.
       val mustHave = Seq(
-        "FL_DATE","CRS_DEP_TIMESTAMP","CRS_ELAPSED_TIME",
-        "ORIGIN_AIRPORT_ID","DEST_AIRPORT_ID","ARR_DELAY_NEW"
+        "FL_DATE",
+        "CRS_DEP_TIMESTAMP",
+        "CRS_ELAPSED_TIME",
+        "ORIGIN_AIRPORT_ID",
+        "DEST_AIRPORT_ID",
+        "ARR_DELAY_NEW",
+        "WEATHER_DELAY",
+        "NAS_DELAY",
+        "HAS_WEATHER_DELAY",
+        "HAS_NAS_DELAY"
       )
-      val optional = Seq("OP_UNIQUE_CARRIER","OP_CARRIER","OP_CARRIER_FL_NUM","OP_CARRIER_AIRLINE_ID")
-      val present = flightsSrc.columns.toSet
+
+      val optional = Seq(
+        "OP_UNIQUE_CARRIER",
+        "OP_CARRIER",
+        "OP_CARRIER_FL_NUM",
+        "OP_CARRIER_AIRLINE_ID"
+      )
+
+      val present  = flightsSrc.columns.toSet
       val keepCols = mustHave ++ optional.filter(present.contains)
 
       val flights = flightsSrc
         .select(keepCols.map(col): _*)
+        // tsa = tsd + durée planifiée (en secondes)
         .withColumn(
           "CRS_ARR_TIMESTAMP",
-          (col("CRS_DEP_TIMESTAMP").cast("long") + (col("CRS_ELAPSED_TIME") * 60).cast("long")).cast("timestamp")
+          (col("CRS_DEP_TIMESTAMP").cast("long") +
+            (col("CRS_ELAPSED_TIME") * 60).cast("long"))
+            .cast("timestamp")
         )
+        // Identifiant technique de vol, plus simple à utiliser dans les
+        // jointures que les triplets (date, vol, compagnie).
         .withColumn("flight_id", monotonically_increasing_id())
         .repartition(col("ORIGIN_AIRPORT_ID"))
         .persist(StorageLevel.MEMORY_AND_DISK)
 
       flightsPersisted = Some(flights)
-      log.info(s"[Join] flights columns kept = ${keepCols.mkString(",")}")
+      log.info(s"[Join] Colonnes vols conservées = ${keepCols.mkString(",")}")
 
-      // bornes temporelles pour pruner la météo
-      sc.setJobDescription("Compute time bounds for weather pruning")
-      val bounds = flights.agg(
-        min(col("CRS_DEP_TIMESTAMP")).as("min_dep"),
-        max(col("CRS_ARR_TIMESTAMP")).as("max_arr")
-      ).first()
+      // Bornes temporelles utiles pour la météo :
+      // le jeu météo couvre plusieurs années, mais seule la période
+      // où des vols existent est pertinente pour le projet.
+      sc.setJobDescription("Calcul des bornes temporelles pour le filtrage météo")
 
-      val minNeeded = bounds.getAs[java.sql.Timestamp]("min_dep")
-      val maxNeeded = bounds.getAs[java.sql.Timestamp]("max_arr")
-      val minCut = new java.sql.Timestamp(minNeeded.getTime - windowHours.toLong * 3600 * 1000L)
-      val maxCut = new java.sql.Timestamp(maxNeeded.getTime + 3600 * 1000L) // +1h de marge
-      log.info(s"[Join] weather pruning window = [$minCut .. $maxCut]")
+      val bounds = flights
+        .agg(
+          min(col("CRS_DEP_TIMESTAMP")).as("min_dep"),
+          max(col("CRS_ARR_TIMESTAMP")).as("max_arr")
+        )
+        .first()
 
-      // 2) METEO : prune temporel + whitelist
-      sc.setJobDescription("Read & prune weather, select features")
-      val weatherRaw = spark.read.format("delta").load(weatherCleanPath)
+      val minDep = bounds.getAs[java.sql.Timestamp]("min_dep")
+      val maxArr = bounds.getAs[java.sql.Timestamp]("max_arr")
+
+      val minCut = new java.sql.Timestamp(
+        minDep.getTime - windowHours.toLong * 3600L * 1000L
+      )
+      // Marge de +1h après l’arrivée planifiée pour couvrir les lags
+      // à destination, conformément à l’esprit de la fenêtre temporelle
+      // de l’article (section 2.2).
+      val maxCut = new java.sql.Timestamp(
+        maxArr.getTime + 1L * 3600L * 1000L
+      )
+
+      log.info(s"[Join] Fenêtre temporelle météo = [$minCut .. $maxCut]")
+
+      // ------------------------------------------------------------------
+      // 2) Météo : filtrage temporel et sélection de features
+      //
+      // Référence article : "Joint Table" (section 2.3) et Algorithme 1.
+      // La logique de filtrage [ts − windowHours, ts] est exprimée
+      // directement en timestamps plutôt qu’en (date, heure).
+      // ------------------------------------------------------------------
+      sc.setJobDescription("Chargement de la météo filtrée et sélection des variables")
+
+      val weatherBase = spark.read.format("delta").load(weatherCleanPath)
         .where(col("timestamp").between(lit(minCut), lit(maxCut)))
         .repartition(col("AirportId"))
 
-      val (wSelAll0, featureCols0) = selectWeatherColumns(weatherRaw)
+      // Renommage du timestamp en `w_ts` pour clarifier son rôle dans
+      // Wo et Wd et éviter les conflits de noms.
+      val weatherWithTs = weatherBase.withColumnRenamed("timestamp", "w_ts")
+
+      val (wSelAll0, featureCols) = selectWeatherColumns(weatherWithTs)
       val wSelAll = wSelAll0.persist(StorageLevel.MEMORY_AND_DISK)
       wSelAllPersisted = Some(wSelAll)
-      val featureCols = featureCols0
-      log.info(s"[Join] #features météo (hors w_ts): ${featureCols.size} ; lags=$lags")
 
-      // matérialisation légère caches
-      sc.setJobDescription("Materialize cached inputs")
-      flights.count(); wSelAll.count()
+      log.info(
+        s"[Join] Nombre de variables météo retenues (hors w_ts) : ${featureCols.size} ; " +
+          s"lags demandés = $lags, lags effectifs = $effectiveLags"
+      )
 
-      // 3) ORIGINE
-      sc.setJobDescription("Join ORIGIN weather and limit to lags")
-      val wOrig = wSelAll.withColumnRenamed("apt_id", "orig_apt")
-        .withColumnRenamed("w_ts",  "orig_w_ts")
+      // Matérialisation des caches pour fixer le plan d’exécution.
+      sc.setJobDescription("Matérialisation des caches vols / météo")
+      flights.count()
+      wSelAll.count()
+
+      // ------------------------------------------------------------------
+      // 3) Jointure avec la météo à l’origine (Wo)
+      //
+      // Référence : Wo = <O(Ao, tsd), O(Ao, tsd−1h), …>.
+      // Pour chaque vol :
+      //   - recherche des observations météo de l’aéroport d’origine
+      //     dans [CRS_DEP_TIMESTAMP − windowHours, CRS_DEP_TIMESTAMP],
+      //   - tri par date décroissante,
+      //   - limitation aux `effectiveLags` mesures les plus récentes.
+      // ------------------------------------------------------------------
+      sc.setJobDescription("Jointure avec la météo ORIGINE (construction de Wo)")
+
+      val wOrig = wSelAll
+        .withColumnRenamed("apt_id", "orig_apt")
+        .withColumnRenamed("w_ts",   "orig_w_ts")
 
       val joinOrig = flights.join(
         wOrig,
@@ -142,26 +297,42 @@ final class JoinFlightsWeather(
         "left"
       )
 
-      val wDescOrig = Window.partitionBy(col("flight_id")).orderBy(col("orig_w_ts").desc)
-      val origLimited =
-        if (lags > 0) joinOrig.withColumn("rk", row_number().over(wDescOrig)).filter(col("rk") <= lags).drop("rk")
-        else           joinOrig.withColumn("rk", row_number().over(wDescOrig)).filter(col("rk") === 1).drop("rk")
+      val wDescOrig =
+        Window.partitionBy(col("flight_id")).orderBy(col("orig_w_ts").desc)
 
-      sc.setJobDescription("Aggregate ORIGIN weather (collect_list)")
-      val originAgg =
-        if (lags > 0)
-          origLimited.groupBy(col("flight_id"))
-            .agg(collect_list(struct((col("orig_w_ts").as("w_ts") +: featureCols.map(col)):_*)).as("weather_origin"))
-        else
-          origLimited.select(
-            col("flight_id"),
-            struct((col("orig_w_ts").as("w_ts") +: featureCols.map(col)):_*).as("weather_origin_single")
-          )
+      val origRanked = joinOrig
+        .withColumn("rk", row_number().over(wDescOrig))
+        .filter(col("rk") <= effectiveLags)
+        .drop("rk")
 
-      // 4) DESTINATION
-      sc.setJobDescription("Join DEST weather and limit to lags")
-      val wDest = wSelAll.withColumnRenamed("apt_id", "dest_apt")
-        .withColumnRenamed("w_ts",  "dest_w_ts")
+      val originAggRaw = origRanked
+        .groupBy(col("flight_id"))
+        .agg(
+          collect_list(
+            struct(
+              col("orig_w_ts").as("w_ts") +:
+                featureCols.map(col): _*
+            )
+          ).as("weather_origin")
+        )
+
+      val originAgg = originAggRaw.withColumn(
+        "weather_origin",
+        expr(s"slice(reverse(sort_array(weather_origin, false)), 1, $effectiveLags)")
+      )
+
+      // ------------------------------------------------------------------
+      // 4) Jointure avec la météo à destination (Wd)
+      //
+      // Référence : Wd = <D(Ad, tsa), D(Ad, tsa−1h), …>.
+      // Construction symétrique de Wo, basée cette fois sur l’heure
+      // d’arrivée planifiée.
+      // ------------------------------------------------------------------
+      sc.setJobDescription("Jointure avec la météo DESTINATION (construction de Wd)")
+
+      val wDest = wSelAll
+        .withColumnRenamed("apt_id", "dest_apt")
+        .withColumnRenamed("w_ts",   "dest_w_ts")
 
       val flightsForDest = flights.repartition(col("DEST_AIRPORT_ID"))
 
@@ -173,105 +344,87 @@ final class JoinFlightsWeather(
         "left"
       )
 
-      val wDescDest = Window.partitionBy(col("flight_id")).orderBy(col("dest_w_ts").desc)
-      val destLimited =
-        if (lags > 0) joinDest.withColumn("rk", row_number().over(wDescDest)).filter(col("rk") <= lags).drop("rk")
-        else           joinDest.withColumn("rk", row_number().over(wDescDest)).filter(col("rk") === 1).drop("rk")
+      val wDescDest =
+        Window.partitionBy(col("flight_id")).orderBy(col("dest_w_ts").desc)
 
-      sc.setJobDescription("Aggregate DEST weather (collect_list)")
-      val destAgg =
-        if (lags > 0)
-          destLimited.groupBy(col("flight_id"))
-            .agg(collect_list(struct((col("dest_w_ts").as("w_ts") +: featureCols.map(col)):_* )).as("weather_dest"))
-        else
-          destLimited.select(
-            col("flight_id"),
-            struct((col("dest_w_ts").as("w_ts") +: featureCols.map(col)):_*).as("weather_dest_single")
-          )
+      val destRanked = joinDest
+        .withColumn("rk", row_number().over(wDescDest))
+        .filter(col("rk") <= effectiveLags)
+        .drop("rk")
 
-      // 5) Fusion sur flight_id puis ajout des colonnes vol
-      sc.setJobDescription("Join ORIGIN/DEST aggregates with flights")
+      val destAggRaw = destRanked
+        .groupBy(col("flight_id"))
+        .agg(
+          collect_list(
+            struct(
+              col("dest_w_ts").as("w_ts") +:
+                featureCols.map(col): _*
+            )
+          ).as("weather_dest")
+        )
+
+      val destAgg = destAggRaw.withColumn(
+        "weather_dest",
+        expr(s"slice(reverse(sort_array(weather_dest, false)), 1, $effectiveLags)")
+      )
+
+      // ------------------------------------------------------------------
+      // 5) Fusion avec les colonnes de vols et écriture Delta
+      //
+      // Référence article : "Joint Table" JT (section 2.3).
+      // La table jointe contient :
+      //   - Fs (infos vol),
+      //   - Wo et Wd (historique météo),
+      //   - les colonnes de cause de retard nécessaires pour
+      //     reconstruire les ensembles D1–D4 (section 4.2).
+      // ------------------------------------------------------------------
+      sc.setJobDescription("Fusion Wo/Wd avec les vols et écriture de join_intermediate")
 
       val baseColsFixed = Seq(
-        "flight_id","FL_DATE","CRS_DEP_TIMESTAMP","CRS_ELAPSED_TIME","CRS_ARR_TIMESTAMP",
-        "ORIGIN_AIRPORT_ID","DEST_AIRPORT_ID","ARR_DELAY_NEW"
-      ) ++ Seq("OP_UNIQUE_CARRIER","OP_CARRIER","OP_CARRIER_FL_NUM","OP_CARRIER_AIRLINE_ID").filter(present.contains)
+        "flight_id",
+        "FL_DATE",
+        "CRS_DEP_TIMESTAMP",
+        "CRS_ELAPSED_TIME",
+        "CRS_ARR_TIMESTAMP",
+        "ORIGIN_AIRPORT_ID",
+        "DEST_AIRPORT_ID",
+        "ARR_DELAY_NEW",
+        "WEATHER_DELAY",
+        "NAS_DELAY",
+        "HAS_WEATHER_DELAY",
+        "HAS_NAS_DELAY"
+      ) ++ Seq(
+        "OP_UNIQUE_CARRIER",
+        "OP_CARRIER",
+        "OP_CARRIER_FL_NUM",
+        "OP_CARRIER_AIRLINE_ID"
+      ).filter(present.contains)
 
       val flightsBase = flights.select(baseColsFixed.map(col): _*)
 
       val joinedCore =
-        if (lags > 0) flightsBase.join(originAgg, "flight_id").join(destAgg, "flight_id")
-        else          flightsBase.join(originAgg, "flight_id").join(destAgg, "flight_id")
+        flightsBase.join(originAgg, "flight_id").join(destAgg, "flight_id")
 
       val joined = joinedCore.select(
         (baseColsFixed.filter(_ != "flight_id").map(col) :+
-          col(if (lags > 0) "weather_origin" else "weather_origin_single")) :+
-          col(if (lags > 0) "weather_dest"   else "weather_dest_single") : _*
+          col("weather_origin") :+
+          col("weather_dest")): _*
       )
 
-      // 5bis) Écriture de l'intermédiaire et coupure du DAG
-      sc.setJobDescription("Write intermediate Delta (cut DAG)")
       joined.write.format("delta").mode("overwrite").save(outIntermediate)
-      log.info(s"[Join] Intermédiaire (Delta) → $outIntermediate")
+      log.info(s"[Join] Table intermédiaire (Delta) écrite dans $outIntermediate")
 
-      // -----------------------------
-      // 6) Aplatissement + agrégats (DÉSACTIVÉ)
-      // -----------------------------
-      /*
-      sc.setJobDescription(s"Flatten + aggregates (lags=$lags)")
-      val joinedMat = spark.read.format("delta").load(outIntermediate)
+      // Bloc "flat + agrégats" désactivé pour l’instant.
+      // Il permettrait de rapprocher encore davantage la construction
+      // de features de la description de l’article (min, max, moyenne,
+      // variation de certaines séries météo). Le volume produit en
+      // local risquerait cependant d’être important.
 
-      val originStruct = joinedMat.schema("weather_origin").dataType.asInstanceOf[ArrayType]
-        .elementType.asInstanceOf[StructType]
-
-      val numericFields = originStruct.fields
-        .filter(f => f.dataType.isInstanceOf[NumericType])
-        .map(_.name)
-        .filter(_ != "w_ts")
-
-      val flatBase = joinedMat.columns.filterNot(c => c == "weather_origin" || c == "weather_dest").map(col)
-
-      val origLagCols: Seq[Column] =
-        (0 until lags).flatMap { k =>
-          featureCols.map(f => col("weather_origin").getItem(k).getField(f).alias(s"orig_${f}_lag$k")) ++
-            Seq(col("weather_origin").getItem(k).getField("w_ts").alias(s"orig_wts_lag$k"))
-        }
-
-      val destLagCols: Seq[Column] =
-        (0 until lags).flatMap { k =>
-          featureCols.map(f => col("weather_dest").getItem(k).getField(f).alias(s"dest_${f}_lag$k")) ++
-            Seq(col("weather_dest").getItem(k).getField("w_ts").alias(s"dest_wts_lag$k"))
-        }
-
-      val flat = joinedMat.select((flatBase ++ origLagCols ++ destLagCols): _*)
-
-      def aggCols(prefix: String, f: String): Seq[Column] = {
-        val kCols = (0 until lags).map(k => s"${prefix}_${f}_lag$k")
-        val minC = array_min(array(kCols.map(c => col(c)):_*)).alias(s"${prefix}_${f}_min")
-        val maxC = array_max(array(kCols.map(c => col(c)):_*)).alias(s"${prefix}_${f}_max")
-        val sumExpr = kCols.mkString(" + ")
-        val avgC = expr(s"( $sumExpr ) / $lags").alias(s"${prefix}_${f}_avg")
-        val deltaC = (col(s"${prefix}_${f}_lag0") - col(s"${prefix}_${f}_lag${lags - 1}")).alias(s"${prefix}_${f}_delta")
-        Seq(minC, maxC, avgC, deltaC)
-      }
-      val originAggCols = numericFields.flatMap(f => aggCols("orig", f))
-      val destAggCols   = numericFields.flatMap(f => aggCols("dest", f))
-
-      val flatAgg = flat.select( (flat.columns.map(col) ++ originAggCols ++ destAggCols): _* )
-
-      val bad = "[ ,;{}()\\n\\t=]+".r
-      val cols = flatAgg.columns.map(c => bad.replaceAllIn(c, "_"))
-      val sanitized = flatAgg.toDF(cols: _*)
-
-      sanitized.write.format("delta").mode("overwrite").save(outFlat)
-      log.info(s"[Join] Flat + Agg (lags=$lags) → $outFlat")
-      */
-
-      // libère la mémoire
+      // Libération explicite de la mémoire
       wSelAllPersisted.foreach(_.unpersist())
       flightsPersisted.foreach(_.unpersist())
 
-      // retourne l'intermédiaire tel qu'écrit
+      // Retour de la table intermédiaire (utile pour les tests).
       spark.read.format("delta").load(outIntermediate)
 
     } finally {
