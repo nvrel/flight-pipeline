@@ -7,8 +7,6 @@ import flightpipeline.stage._
 import flightpipeline.report.ShowTrainingRuns
 import org.apache.spark.sql.SparkSession
 import org.slf4j.LoggerFactory
-import flightpipeline.eval.DelayDataset
-
 
 object Main {
   private val log = LoggerFactory.getLogger(getClass)
@@ -20,7 +18,17 @@ object Main {
     val conf = ConfigFactory.load().getConfig("app")
 
     // Valeurs par défaut : peuvent être surchargées par la ligne de commande
-    // via Args.parse (ex. --mode join --lags 7 --delay-threshold 60)
+    // via Args.parse (ex. --mode join --lags 7 --delay-threshold 60).
+    //
+    // Pour delay-dataset et feature-set :
+    //   - delay-dataset : D1, D2, D3, D4 ou ALL (section 4.2 de l’article),
+    //   - feature-set   : with-weather / no-weather (modèle avec ou sans météo).
+    val defaultDelayDataset =
+      if (conf.hasPath("delay-dataset")) conf.getString("delay-dataset") else "D2"
+
+    val defaultFeatureSet =
+      if (conf.hasPath("feature-set")) conf.getString("feature-set") else "with-weather"
+
     val defaults = Args(
       flightsDir            = conf.getString("flights-dir"),
       weatherDir            = conf.getString("weather-dir"),
@@ -29,12 +37,12 @@ object Main {
       windowHours           = conf.getInt("window-hours"),
       lags                  = conf.getInt("lags"),
       delayThresholdMinutes = conf.getInt("delay-threshold-minutes"),
-      mode                  = "all",
-      sampleMonth           = None,
-      // Dataset de retards ciblé pour l’entraînement.
-      // Par exemple "D3" comme dans la plupart des graphiques de l’article (section 4.2).
-      delayDataset          = conf.getString("delay-dataset")
+      mode                  = "all",          // pipeline complet par défaut
+      sampleMonth           = None,           // pas de restriction temporelle par défaut
+      delayDataset          = defaultDelayDataset,
+      featureSet            = defaultFeatureSet
     )
+
     // Parsing des arguments CLI : écrase les valeurs de defaults si fourni
     val args  = Args.parse(defaults, rawArgs)
     val paths = DataPaths(args.flightsDir, args.weatherDir, args.airportCsv, args.outRoot)
@@ -67,12 +75,14 @@ object Main {
       .appName("flight-pipeline")
       .getOrCreate()
 
+    // Libellé lisible de l’étendue temporelle utilisée (ALL ou YYYYMM)
     val sampleLabel = args.sampleMonth.getOrElse("ALL")
 
     log.info(
       s"=== flight-pipeline " +
         s"(mode=${args.mode}, hours=${args.windowHours}, lags=${args.lags}, " +
         s"delay-threshold-min=${args.delayThresholdMinutes}, " +
+        s"delay-dataset=${args.delayDataset}, feature-set=${args.featureSet}, " +
         s"sample=$sampleLabel) ==="
     )
 
@@ -82,7 +92,7 @@ object Main {
     // Ce mode ne relance aucun traitement de préparation / jointure /
     // entraînement. Il se contente de relire out/metrics/train_runs
     // (produit par TrainRunLogger) et de générer :
-    //   - un résumé dans les logs,
+    //   - un résumé lisible dans les logs,
     //   - un export CSV détaillé dans out/metrics/train_runs_export.
     // --------------------------------------------------------------------
     if (args.mode == "report") {
@@ -95,6 +105,10 @@ object Main {
 
     // --------------------------------------------------------------------
     // 4) Préparation des données brutes (flights + weather) → tables Delta "clean"
+    //
+    // Référence article : sections 2.1–2.3, où la préparation des
+    // données et la jointure avec la météo représentent une part
+    // importante du travail (ingénierie des données).
     // --------------------------------------------------------------------
     if (args.mode == "prepare" || args.mode == "all") {
       val t0 = System.currentTimeMillis()
@@ -142,7 +156,7 @@ object Main {
       spark.sql("SET spark.sql.cbo.enabled=true")
       // ANALYZE TABLE désactivé pour éviter les soucis avec Delta 3.2 / Spark 3.5
 
-      // Contrôle qualité
+      // Contrôle qualité des tables "clean" (cohérence vols/météo/aéroports)
       new QualityCheck(
         spark,
         paths.flightCleanOut,
@@ -177,6 +191,9 @@ object Main {
 
     // --------------------------------------------------------------------
     // 6) Jointure flights + weather → table Delta join_intermediate
+    //
+    // Référence : sections 2.2–2.3 de l’article (construction de Wo/Wd
+    // et du "Joint Table" JT sur lequel sont définis D1..D4).
     // --------------------------------------------------------------------
     if (args.mode == "join" || args.mode == "all") {
       val t1 = System.currentTimeMillis()
@@ -200,7 +217,13 @@ object Main {
 
     // --------------------------------------------------------------------
     // 7) Entraînement Random Forest sur join_intermediate
-    //    (les métriques détaillées sont journalisées par TrainRunLogger)
+    //
+    // Référence : sections 4.2–4.4 de l’article (construction des
+    // datasets D1..D4, échantillonnage équilibré, métriques Acc/Reco/Recd).
+    //
+    // Les métriques détaillées (train/test) sont journalisées par
+    // TrainRunLogger, puis ShowTrainingRuns construit un tableau de
+    // synthèse et un export CSV.
     // --------------------------------------------------------------------
     if (args.mode == "training" || args.mode == "train" || args.mode == "all") {
       val t2 = System.currentTimeMillis()
@@ -211,18 +234,18 @@ object Main {
         outRoot               = args.outRoot,
         lags                  = args.lags,
         delayThresholdMinutes = args.delayThresholdMinutes,
-        delayDatasetId        = args.delayDataset
+        delayDatasetId        = args.delayDataset,
+        featureSetId          = args.featureSet
       )
 
-      // run() entraîne le modèle, écrit les métriques détaillées
-      // et journalise le run dans out/metrics/train_runs via TrainRunLogger.
+      // run() retourne un DataFrame à une seule ligne avec les métriques test
       val metricsDF  = trainer.run()
       val metricsRow = metricsDF.first()
 
       // Correspondance avec les noms de colonnes produits par saveTestMetrics
       val accuracy      = metricsRow.getAs[Double]("accuracy")
-      val recallDelayed = metricsRow.getAs[Double]("recall_pos")   // rappel classe 1 (retards)
-      val recallOnTime  = metricsRow.getAs[Double]("specificity")  // rappel classe 0 (à l'heure)
+      val recallDelayed = metricsRow.getAs[Double]("recall_pos")   // rappel classe 1 (retards, Recd)
+      val recallOnTime  = metricsRow.getAs[Double]("specificity")  // rappel classe 0 (à l'heure, Reco)
 
       log.info(
         f"[training] Terminé : accuracy=$accuracy%.4f, " +
@@ -231,13 +254,7 @@ object Main {
       )
       log.info(s"[training] Durée: ${(System.currentTimeMillis() - t2) / 1000.0}s")
 
-      // Après chaque expérience d'entraînement, on rafraîchit la vue globale
-      // des runs : lecture de out/metrics/train_runs (Delta) et écriture
-      // d'un CSV consolidé dans out/metrics/train_runs_export.
-      //
-      // Ce bloc correspond à la logique de synthèse des résultats décrite
-      // dans l’article (sections 4.3–4.4) lorsque les auteurs comparent
-      // systématiquement les configurations (Acc / Reco / Recd).
+      // Mise à jour du tableau de synthèse + CSV après ce run
       ShowTrainingRuns.run(spark, args.outRoot)
     }
 

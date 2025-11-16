@@ -14,6 +14,10 @@ set -euo pipefail
 # 1) Paramètres locaux centralisés
 source "$(dirname "$0")/env-local.sh"
 
+# Valeurs par défaut si l'environnement ne les définit pas déjà
+: "${FP_OUT_ROOT:=out}"
+: "${FP_DELAY_DATASET:=D2}"         # D3 = bad-weather delays (article, section 4.2)
+: "${FP_FEATURE_SET:=with-weather}" # with-weather / no-weather
 : "${FP_OUT_ROOT:=out}"
 
 CMD="${1:-}"   # "all", "prepare", "join", "training", "train", "quality", "report", "show-runs"
@@ -72,9 +76,11 @@ fi
 # 3) Mode "normal" : exécution du pipeline Spark
 # ---------------------------------------------------------------------------
 
-MODE="${CMD:-all}"    # si aucun argument → "all"
-LAGS="${2:-7}"
-MONTH="${3:-}"        # ex : 201201
+MODE="${CMD:-all}"                           # all / prepare / join / training / ...
+LAGS="${2:-7}"                               # nombre de lags
+DELAY_DATASET="${3:-$FP_DELAY_DATASET}"      # D1 / D2 / D3 / D4 / ALL
+FEATURE_SET="${4:-$FP_FEATURE_SET}"          # with-weather / no-weather
+MONTH="${5:-}"                               # ex: 201201
 
 # Normalisation : "train" → "training"
 case "$MODE" in
@@ -112,7 +118,10 @@ CLI_ARGS=(
   --hours 12
   --delay-threshold-min 60
   --lags "$LAGS"
+  --delay-dataset "$DELAY_DATASET"
+  --feature-set "$FEATURE_SET"
 )
+
 
 if [[ -n "$MONTH" ]]; then
   CLI_ARGS+=(--sample-month "$MONTH")

@@ -100,3 +100,11 @@ export FP_TRAIN_LOCATION="${FP_TRAIN_LOCATION:-local}"
 # "baseline 7 lags, mois 2008-01"). Si vide, la colonne `comment`
 # sera simplement nulle dans le journal.
 export FP_RUN_COMMENT="${FP_RUN_COMMENT:-}"
+
+# Jeu de retards par défaut pour l'entraînement (section 4.2, D1–D4).
+export FP_DELAY_DATASET="${FP_DELAY_DATASET:-D2}"
+
+# Jeu de features par défaut :
+#  - with-weather  : Random Forest avec lags météo Wo/Wd
+#  - no-weather    : baseline sans données météo
+export FP_FEATURE_SET="${FP_FEATURE_SET:-with-weather}"

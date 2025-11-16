@@ -7,9 +7,21 @@ package flightpipeline.config
  * dans application.conf, mais peuvent être surchargés par la ligne de
  * commande (voir `parse` plus bas).
  *
- * Nouveau paramètre :
+ * Paramètres ajoutés par rapport à la première version :
+ *
  *   - delayDataset : identifiant du dataset de retards ciblé (D1..D4),
- *     au sens de la section 4.2 de Belcastro et al. (définition de D1–D4).
+ *                    au sens de la section 4.2 de Belcastro et al.
+ *                    ("Bad-weather delays detection", définition de D1–D4).
+ *
+ *   - featureSet   : choix du jeu de features utilisé pour l’entraînement,
+ *                    pour reproduire la comparaison de la section 4 :
+ *                      • "with-weather"    : vol + lags météo Wo/Wd,
+ *                      • "no-weather"      : vol uniquement,
+ *                      • "article-weather" : sous-ensemble de variables météo
+ *                                            correspondant à celles décrites
+ *                                            dans l’article (température,
+ *                                            humidité, vent, visibilité,
+ *                                            plafond, précipitations…).
  */
 final case class Args(
                        flightsDir: String,
@@ -21,7 +33,8 @@ final case class Args(
                        delayThresholdMinutes: Int,
                        mode: String,
                        sampleMonth: Option[String],
-                       delayDataset: String            // "D1", "D2", "D3", "D4" ou "D_all"
+                       delayDataset: String,         // "D1", "D2", "D3", "D4" ou "D_all"
+                       featureSet: String           // "with-weather", "no-weather", "article-weather"
                      )
 
 object Args {
@@ -34,7 +47,8 @@ object Args {
    *   --clé valeur
    *
    * Exemple :
-   *   --mode training --lags 7 --delay-threshold-min 60 --delay-dataset D3
+   *   --mode training --lags 7 --delay-threshold-min 60 \
+   *   --delay-dataset D2 --feature-set article-weather
    *
    * Les valeurs non fournies conservent celles de `defaults`.
    */
@@ -58,7 +72,7 @@ object Args {
     val windowHours = intOpt("hours").getOrElse(defaults.windowHours)
     val lags        = intOpt("lags").getOrElse(defaults.lags)
 
-    // On tolère --delay-threshold et --delay-threshold-min
+    // On tolère --delay-threshold et --delay-threshold-min.
     val delayThMin =
       cli.get("delay-threshold-min")
         .orElse(cli.get("delay-threshold"))
@@ -81,8 +95,12 @@ object Args {
         )
     }
 
-    // Dataset ciblé : D1, D2, D3, D4 ou ALL/D_all.
-    // Référence : Belcastro et al., TIST 2014, section 4.2 (datasets D1–D4).
+    // -----------------------------
+    // Dataset de retard ciblé (D1..D4)
+    // -----------------------------
+    //
+    // Référence : Belcastro et al., section 4.2
+    // ("Bad-weather delays detection", définition de D1–D4).
     val delayDataset: String = {
       val rawValue =
         cli.get("delay-dataset")
@@ -100,6 +118,39 @@ object Args {
       }
     }
 
+    // -----------------------------
+    // Jeu de features (with/no/article-weather)
+    // -----------------------------
+    //
+    // Ce paramètre pilote le type d’expérience :
+    //   - with-weather    : vol + lags Wo/Wd,
+    //   - no-weather      : vol sans météo (baseline),
+    //   - article-weather : variables météo restreintes à celles décrites
+    //                       dans l’article (température, humidité,
+    //                       vent, visibilité, plafond, précipitation…).
+    val featureSet: String = {
+      val rawValue =
+        cli.get("feature-set")
+          .getOrElse(defaults.featureSet)
+
+      rawValue.trim.toLowerCase.replace(' ', '-').replace('_', '-') match {
+        case "with-weather" | "withweather" | "weather" | "full" =>
+          "with-weather"
+
+        case "no-weather" | "noweather" | "baseline" | "sans-meteo" | "sansmeteo" =>
+          "no-weather"
+
+        case "article-weather" | "articleweather" | "paper-weather" | "article" =>
+          "article-weather"
+
+        case other =>
+          throw new IllegalArgumentException(
+            s"--feature-set doit être 'with-weather', 'no-weather' ou 'article-weather'. " +
+              s"Valeur reçue : $other"
+          )
+      }
+    }
+
     defaults.copy(
       flightsDir            = flightsDir,
       weatherDir            = weatherDir,
@@ -110,7 +161,8 @@ object Args {
       delayThresholdMinutes = delayThMin,
       mode                  = mode,
       sampleMonth           = sampleMonth,
-      delayDataset          = delayDataset
+      delayDataset          = delayDataset,
+      featureSet            = featureSet
     )
   }
 }

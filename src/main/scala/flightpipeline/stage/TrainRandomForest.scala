@@ -18,16 +18,21 @@ import flightpipeline.eval.TrainRunLogger
  * `join_intermediate` produite par `JoinFlightsWeather`.
  *
  * Label binaire :
- *   – 1.0 : vol "fortement retardé" (ARR_DELAY_NEW >= seuil)
+ *   – 1.0 : vol "fortement retardé" (ARR_DELAY_NEW ≥ seuil)
  *   – 0.0 : vol à l’heure         (ARR_DELAY_NEW <  seuil)
  *
  * La sélection des vols positifs suit la définition des jeux D1–D4
- * de Belcastro et al., TIST 2014, section 4.2 ("Bad-weather delays detection").:contentReference[oaicite:1]{index=1}
+ * de Belcastro et al., TIST 2014, section 4.2 ("Bad-weather delays detection").
  *
  * Paramètres importants :
  *   – delayThresholdMinutes : seuil sur ARR_DELAY_NEW (ex. 60 minutes),
  *   – lags                  : profondeur des séries météo Wo/Wd,
- *   – delayDatasetId        : "D1", "D2", "D3", "D4" ou "ALL".
+ *   – delayDatasetId        : "D1", "D2", "D3", "D4" ou "ALL",
+ *   – featureSetId          : jeu de features utilisé côté modèle :
+ *       • "with-weather"    : vol + toutes les features météo Wo/Wd disponibles,
+ *       • "no-weather"      : uniquement les features de vol (baseline sans météo),
+ *       • "article-weather" : uniquement les variables météo mentionnées
+ *                             explicitement dans l’article (T, H, Wd, Ws, P, S, V, Di).
  *
  * Entrée :
  *   – joinIntermediatePath : Delta join_intermediate
@@ -43,7 +48,8 @@ final class TrainRandomForest(
                                outRoot: String,
                                lags: Int,
                                delayThresholdMinutes: Int = 60,
-                               delayDatasetId: String = "D3"  // D3 = "bad-weather delays" dans l’article
+                               delayDatasetId: String = "D2",          // D1..D4 / ALL : jeux de retards (article section 4.2)
+                               featureSetId: String = "with-weather"   // "with-weather" / "no-weather" / "article-weather"
                              ) {
 
   private val log = LoggerFactory.getLogger(getClass)
@@ -53,8 +59,12 @@ final class TrainRandomForest(
    * de l'environnement (variable FP_RF_MAX_ROWS_PER_CLASS).
    *
    * Cette valeur contrôle la taille maximale de chaque classe
-   * dans l'échantillon équilibré décrit dans l'article
+   * dans l'échantillon équilibré décrit dans l’article
    * (section 4.2, Figure 4).
+   *
+   * Si la variable n’est pas définie ou invalide, repli
+   * sur 400 000 lignes par classe, ce qui donne un dataset
+   * de l’ordre du million de lignes après under‑sampling + split.
    */
   private val maxRowsPerClass: Long = {
     val raw = sys.env.get("FP_RF_MAX_ROWS_PER_CLASS")
@@ -66,18 +76,115 @@ final class TrainRandomForest(
     raw.flatMap(v => scala.util.Try(v.toLong).toOption)
       .getOrElse(400000L)
   }
+
+  /**
+   * Choix du jeu de features :
+   *
+   *   – "with-weather"    : vol + toutes les features météo Wo/Wd produites
+   *                         par `JoinFlightsWeather` (liste complète de selectWeatherColumns).
+   *
+   *   – "no-weather"      : modèle de référence qui ne voit que les caractéristiques
+   *                         du vol (aéroports, horaires, etc.), comme dans la
+   *                         section expérimentale où l’article montre qu’un modèle
+   *                         sans météo fait déjà mieux que le hasard grâce à l’effet
+   *                         "aéroport" et à quelques variables de vol.
+   *
+   *   – "article-weather" : jeu de features météo restreint aux variables décrites
+   *                         explicitement dans la section 2.3 de l’article :
+   *                           T (température),
+   *                           H (humidité),
+   *                           Wd/Ws (direction / vitesse du vent),
+   *                           P (pression barométrique),
+   *                           S (sky condition),
+   *                           V (visibilité),
+   *                           Di (descripteur de phénomènes météo).
+   *
+   * La valeur passée au constructeur (featureSetId) est normalisée ici
+   * pour absorber les variations de casse et de séparateurs.
+   */
+  private val (normalizedFeatureSetId: String,
+  includeWeatherFeatures: Boolean,
+  articleWeatherFieldWhitelist: Option[Set[String]]) = {
+
+    // Noyau des attributs météo correspondant aux variables citées dans l’article (section 2.3).
+    // Mapping informel :
+    //   - T  → DryBulbFarenheit
+    //   - H  → RelativeHumidity
+    //   - Ws → WindSpeed
+    //   - Wd → WindDirection
+    //   - P  → SeaLevelPressure
+    //   - V  → Visibility
+    //   - S  → variables de couverture nuageuse (sky_*)
+    //   - Di → scores wt_score_* dérivés du descripteur de phénomènes
+    val articleWeatherCoreFields: Set[String] = Set(
+      // Thermiques / humidité / pression / vent / visibilité
+      "DryBulbFarenheit",
+      "RelativeHumidity",
+      "WindSpeed",
+      "WindDirection",
+      "SeaLevelPressure",
+      "Visibility",
+      // Sky condition (nuages / convection)
+      "sky_num_layers",
+      "sky_min_altitude",
+      "sky_max_altitude",
+      "sky_mean_altitude",
+      // Phénomènes météo (descripteur Di, pondéré)
+      "wt_score_RA","wt_score_TS","wt_score_FG","wt_score_BR",
+      "wt_score_FZ","wt_score_SN","wt_score_SH","wt_score_DZ"
+    )
+
+    val norm = Option(featureSetId)
+      .getOrElse("with-weather")
+      .trim
+      .toLowerCase
+      .replace(' ', '-')
+      .replace('_', '-')
+
+    norm match {
+      case "with-weather" | "withweather" | "weather" | "full" =>
+        log.info("[Train] Jeu de features = with-weather (vol + toutes les features météo Wo/Wd)")
+        ("with-weather", true, None)
+
+      case "no-weather" | "noweather" | "baseline" | "sans-meteo" | "sansmeteo" =>
+        log.info("[Train] Jeu de features = no-weather (vol uniquement, baseline sans météo)")
+        ("no-weather", false, None)
+
+      case "article-weather" | "articleweather" | "article" | "paper-weather" =>
+        log.info(
+          "[Train] Jeu de features = article-weather " +
+            "(vol + sous-ensemble météo aligné sur T, H, Wd, Ws, P, S, V, Di de l’article)"
+        )
+        ("article-weather", true, Some(articleWeatherCoreFields))
+
+      case other =>
+        log.warn(
+          s"[Train] Jeu de features inconnu '$other', utilisation de 'with-weather' par défaut"
+        )
+        ("with-weather", true, None)
+    }
+  }
+
   /**
    * Point d’entrée principal de l’étape d’entraînement.
    *
    * Le DataFrame renvoyé contient les métriques de test
-   * (accuracy, F1, rappel retardés, rappel vols à l’heure, matrice 2x2).
+   * (accuracy, F1, rappel retardés, rappel vols à l’heure, matrice 2×2).
    */
   def run(): DataFrame = {
     val sc = spark.sparkContext
-    sc.setJobDescription(s"RandomForest training (Th=${delayThresholdMinutes}m, dataset=$delayDatasetId)")
+    sc.setJobDescription(
+      s"RandomForest training (Th=${delayThresholdMinutes}m, dataset=$delayDatasetId, feature-set=$normalizedFeatureSetId)"
+    )
 
-    // Mesure des durées de run (section 4.3 – coût de l’algorithme).
+    // Mesure des durées de run (article section 4.3 – coût d’apprentissage).
     val wallStartNs = System.nanoTime()
+
+    log.info(
+      s"[Train] Jeu de features sélectionné : $normalizedFeatureSetId " +
+        "(with-weather = lags Wo/Wd complets, no-weather = sans météo, article-weather = sous-ensemble article)"
+    )
+
     val threadBean  = ManagementFactory.getThreadMXBean
     val cpuStartOpt =
       if (threadBean.isCurrentThreadCpuTimeSupported)
@@ -86,7 +193,7 @@ final class TrainRandomForest(
 
     try {
       // ------------------------------------------------------------------
-      // 1. Lecture de la table join_intermediate et bornes temporelles
+      // 1. Lecture de la table join_intermediate (résultat de JoinFlightsWeather)
       // ------------------------------------------------------------------
       log.info(s"[Train] Lecture de la table Delta join_intermediate depuis $joinIntermediatePath")
       val joined = spark.read.format("delta").load(joinIntermediatePath)
@@ -94,6 +201,7 @@ final class TrainRandomForest(
       val nJoined = joined.count()
       log.info(s"[Train] Dataset join_intermediate : $nJoined lignes, ${joined.columns.length} colonnes")
 
+      // Bornes de période FL_DATE, utilisées pour documenter le run dans TrainRunLogger.
       val dateBounds = joined
         .agg(
           min(col("FL_DATE")).cast("date").as("min_date"),
@@ -105,21 +213,22 @@ final class TrainRandomForest(
       val dataEnd   = dateBounds.getAs[java.sql.Date]("max_date")
 
       // ------------------------------------------------------------------
-      // 2. Préparation des features (vol + météo)
+      // 2. Préparation des features (vol + météo éventuelle)
       //
-      // Référence : sections 2.2–3 de l’article.
-      //   – construction des caractéristiques horaires du vol
-      //   – extraction des lags Wo/Wd à partir des tableaux météo
+      // Référence : sections 2.2–3 de Belcastro et al.
+      //   – "with-weather"      → extraction de toutes les séries météos Wo/Wd disponibles,
+      //   – "no-weather"        → uniquement les features de vol,
+      //   – "article-weather"   → seulement les variables T, H, Wd, Ws, P, S, V, Di.
       // ------------------------------------------------------------------
-      val prepared = prepareBaseDataset(joined)
+      val prepared = prepareBaseDataset(joined, includeWeatherFeatures)
 
       // ------------------------------------------------------------------
       // 3. Construction des jeux train/test équilibrés
       //
       // Référence : section 4.2 et Figure 4 ("balanced sampling").
-      //   – définition de la classe positive selon D1..D4
-      //   – under-sampling pour équilibrer positifs / vols à l’heure
-      //   – split 75 % / 25 % dans chaque classe
+      //   – définition de la classe positive selon D1..D4,
+      //   – under-sampling pour équilibrer positifs / vols à l’heure,
+      //   – split 75 % / 25 % dans chaque classe.
       // ------------------------------------------------------------------
       val (trainDF, testDF, nTrainPos, nTrainNeg, nTestPos, nTestNeg) =
         buildBalancedTrainTest(prepared)
@@ -158,7 +267,7 @@ final class TrainRandomForest(
       log.info(s"[Train] Sauvegarde du modèle entraîné → $modelPath")
       model.write.overwrite().save(modelPath)
 
-      // Extraction des hyperparamètres effectifs du RF
+      // Extraction des hyperparamètres effectifs du RF.
       val rfStage = model.stages.collectFirst {
         case m: RandomForestClassificationModel => m
       }.getOrElse {
@@ -172,7 +281,7 @@ final class TrainRandomForest(
           .flatMap(v => scala.util.Try(v.toInt).toOption)
           .getOrElse(12)
 
-      // Durées mesurées
+      // Durées mesurées.
       val wallTimeSec =
         (System.nanoTime() - wallStartNs) / 1e9
 
@@ -199,7 +308,9 @@ final class TrainRandomForest(
 
       val commentFromEnv = sys.env.get("FP_RUN_COMMENT").filter(_.nonEmpty)
       val technicalComment =
-        s"dataset=$datasetTag, lags=$lags, windowHours=$windowHoursForLog, maxRowsPerClass=$maxRowsPerClass"
+        s"dataset=$datasetTag, featureSet=$normalizedFeatureSetId, " +
+          s"lags=$lags, windowHours=$windowHoursForLog, " +
+          s"maxRowsPerClass=$maxRowsPerClass"
       val combinedComment =
         (commentFromEnv.toSeq :+ technicalComment).mkString(" | ")
 
@@ -221,7 +332,7 @@ final class TrainRandomForest(
         delayThresholdMinutes     = delayThresholdMinutes,
         lags                      = lags,
         windowHours               = windowHoursForLog,
-        sampleMonth               = Some("ALL"),            // valeur à affiner si un mode échantillon est utilisé
+        sampleMonth               = Some("ALL"),            // à affiner si un mode échantillon est utilisé
         datasetId                 = Some(datasetTag),       // D1/D2/D3/D4/ALL dans la table de log
         dataStart                 = Option(dataStart),
         dataEnd                   = Option(dataEnd),
@@ -262,20 +373,31 @@ final class TrainRandomForest(
   // ---------------------------------------------------------------------------
 
   /**
-   * Prépare le jeu de données pour le Random Forest :
-   *   – colonnes de vol (date, horaires, aéroports),
-   *   – colonnes de retard (WEATHER_DELAY, NAS_DELAY, indicateurs),
-   *   – lags météo à l’origine et à destination,
-   *   – variables horaires simples (heure, jour de la semaine),
-   *   – remplacement des NULL numériques par 0.0.
+   * Prépare le jeu de données pour le Random Forest.
    *
-   * Le but est d’obtenir un DataFrame "plat", sans tableaux, directement
-   * exploitable par VectorAssembler.
+   *  – colonnes de vol (date, horaires, aéroports),
+   *  – colonnes de retard (WEATHER_DELAY, NAS_DELAY, indicateurs),
+   *  – lags météo à l’origine et à destination Wo/Wd (si includeWeatherFeatures = true),
+   *  – variables temporelles simples (heure de départ, jour de la semaine),
+   *  – remplacement systématique des NULL numériques par 0.0.
+   *
+   * Lorsque includeWeatherFeatures = false, cette méthode construit un
+   * jeu de features "baseline" sans météo, comme dans les expériences
+   * où l’article compare avec / sans variables météo.
+   *
+   * Lorsque normalizedFeatureSetId = "article-weather", seules les
+   * variables météo correspondant à T, H, Wd, Ws, P, S, V et Di sont
+   * conservées dans Wo/Wd (cf. section 2.3 de l’article).
    */
-  private def prepareBaseDataset(joined: DataFrame): DataFrame = {
+  private def prepareBaseDataset(
+                                  joined: DataFrame,
+                                  includeWeatherFeatures: Boolean
+                                ): DataFrame = {
+
     val sc = spark.sparkContext
     sc.setJobDescription("TrainRF: préparation des colonnes de base")
 
+    // Colonnes de vol indispensables au label et aux features.
     val baseCols = Seq(
       "FL_DATE",
       "CRS_DEP_TIMESTAMP",
@@ -285,6 +407,8 @@ final class TrainRandomForest(
       "ARR_DELAY_NEW"
     ).filter(joined.columns.contains).map(col)
 
+    // Colonnes de retard nécessaires à la définition des jeux D1..D4
+    // (article section 4.2, "Bad-weather delays detection").
     val delayCols = Seq(
       "WEATHER_DELAY",
       "NAS_DELAY",
@@ -292,22 +416,58 @@ final class TrainRandomForest(
       "HAS_NAS_DELAY"
     ).filter(joined.columns.contains).map(col)
 
-    // Extraction des lags météo Wo/Wd à partir des colonnes array.
+    // Extraction ou non des lags météo Wo/Wd selon le mode choisi.
+    //
+    // Référence article :
+    //   – construction de Wo / Wd et des lags météo (sections 2.2–2.3),
+    //   – comparaison "with weather" / "without weather" (section 4),
+    //   – mode "article-weather" : restriction aux variables météo explicitement citées.
     val weatherCols: Seq[Column] =
-      if (joined.columns.contains("weather_origin") && joined.columns.contains("weather_dest")) {
+      if (includeWeatherFeatures &&
+        joined.columns.contains("weather_origin") &&
+        joined.columns.contains("weather_dest")) {
+
+        // Schéma d’un élément de weather_origin : struct<w_ts, ..., variables météo...>
         val originStruct =
           joined.schema("weather_origin").dataType
             .asInstanceOf[ArrayType]
             .elementType
             .asInstanceOf[StructType]
 
-        val numericFields: Seq[String] =
+        // Candidats : tous les champs numériques de Wo/Wd (hors timestamp),
+        // soit les features produites par selectWeatherColumns côté join.
+        val candidateNumericFields: Seq[String] =
           originStruct.fields
             .filter(f => f.dataType.isInstanceOf[NumericType])
             .map(_.name)
             .filterNot(_ == "w_ts")
 
-        // L’article montre que 7 observations horaires couvrent déjà bien la dynamique.
+        // Si le mode est "article-weather", on restreint cette liste
+        // au noyau T, H, Wd, Ws, P, S, V, Di.
+        val numericFields: Seq[String] =
+          articleWeatherFieldWhitelist match {
+            case Some(whitelist) =>
+              val filtered = candidateNumericFields.filter(whitelist.contains)
+              if (filtered.isEmpty) {
+                // Sécurité : si le schéma ne matche pas la whitelist (changement de noms),
+                // on loggue et on retombe sur tous les champs disponibles.
+                log.warn(
+                  "[Train] Mode article-weather : aucun champ météo commun entre le schéma et la whitelist, " +
+                    "utilisation de tous les champs numériques disponibles."
+                )
+                candidateNumericFields
+              } else {
+                log.info(
+                  s"[Train] Champs météo utilisés en mode article-weather (Wo/Wd) : ${filtered.sorted.mkString(", ")}"
+                )
+                filtered
+              }
+            case None =>
+              candidateNumericFields
+          }
+
+        // L’article montre qu’un historique d’environ 7 heures
+        // capture déjà bien la dynamique des phénomènes météo.
         val effectiveLags = math.min(lags, 7)
 
         def lagCols(prefix: String, arrayCol: String): Seq[Column] =
@@ -319,21 +479,33 @@ final class TrainRandomForest(
 
         lagCols("orig", "weather_origin") ++ lagCols("dest", "weather_dest")
       } else {
-        log.warn("[Train] Colonnes weather_origin / weather_dest absentes : aucune feature météo de lag ne sera utilisée")
+        if (!includeWeatherFeatures) {
+          // Mode baseline "sans météo" :
+          // aucune colonne dérivée de weather_origin / weather_dest
+          // n’est déployée. Le Random Forest ne voit que :
+          //   – FL_DATE, CRS_DEP_TIMESTAMP, CRS_ELAPSED_TIME,
+          //   – ORIGIN_AIRPORT_ID, DEST_AIRPORT_ID,
+          //   – variables horaires dérivées (heure, jour de semaine),
+          //   – colonnes de retard global (ARR_DELAY_NEW) et de cause.
+          log.info("[Train] Jeu de features sans météo : aucun lag Wo/Wd n’est extrait")
+        } else {
+          log.warn("[Train] Colonnes weather_origin / weather_dest absentes : aucun lag météo utilisable")
+        }
         Seq.empty[Column]
       }
 
     val baseWithWeather =
       joined
         .select((baseCols ++ delayCols ++ weatherCols): _*)
+        // Variables temporelles simples (heure de départ, jour de la semaine).
         .withColumn("dep_hour", hour(col("CRS_DEP_TIMESTAMP")))
         .withColumn("dep_dow",  dayofweek(col("FL_DATE")))
 
-    // Les lignes sans ARR_DELAY_NEW ne permettent pas de construire un label.
+    // Les lignes sans ARR_DELAY_NEW ne permettent pas de construire un label binaire.
     val cleaned = baseWithWeather.filter(col("ARR_DELAY_NEW").isNotNull)
 
-    // Remplacement systématique des NULL numériques par 0.0 pour éviter
-    // les problèmes dans le VectorAssembler.
+    // Remplacement homogène des NULL numériques par 0.0 pour éviter les
+    // problèmes dans VectorAssembler.
     val numericCols = cleaned.schema.fields.collect {
       case f if f.dataType.isInstanceOf[NumericType] => f.name
     }
@@ -345,7 +517,10 @@ final class TrainRandomForest(
         cleaned
 
     val nClean = cleanedNoNulls.count()
-    log.info(s"[Train] Dataset après préparation : $nClean lignes, ${cleanedNoNulls.columns.length} colonnes")
+    log.info(
+      s"[Train] Dataset après préparation (includeWeather=$includeWeatherFeatures, featureSet=$normalizedFeatureSetId) : " +
+        s"$nClean lignes, ${cleanedNoNulls.columns.length} colonnes"
+    )
 
     cleanedNoNulls
   }
@@ -355,14 +530,14 @@ final class TrainRandomForest(
   // ---------------------------------------------------------------------------
 
   /**
-   * Condition qui identifie la classe positive (label=1.0)
+   * Condition qui identifie la classe positive (label = 1.0)
    * en fonction du jeu D1..D4 ciblé.
    *
    * Traduction en SQL des définitions de la section 4.2 :
    *   – D1 : retards presque entièrement dus à la météo ou NAS,
    *   – D2 : retards avec composante météo ou NAS_DELAY ≥ seuil,
    *   – D3 : retards où la météo ou NAS interviennent, même avec d’autres causes,
-   *   – D4 : tous les retards (ARR_DELAY_NEW >= seuil),
+   *   – D4 : tous les retards (ARR_DELAY_NEW ≥ seuil),
    *   – ALL : comportement large similaire à D3.
    */
   private def positiveFilterForDataset(datasetId: String,
@@ -393,7 +568,7 @@ final class TrainRandomForest(
           (weatherOrNasMinutes > lit(0.0) || hasWeatherOrNasFlag) &&
           (otherCauseMinutes <= lit(0.5))
 
-      // D2 : retards météo OU retards avec NAS_DELAY >= seuil.
+      // D2 : retards météo OU retards avec NAS_DELAY ≥ seuil.
       case "D2" =>
         isDelayed && (
           weatherMinutes > lit(0.0) ||
@@ -401,7 +576,7 @@ final class TrainRandomForest(
           )
 
       // D3 : retards où météo ou NAS interviennent, quelle que soit la part
-      // des autres causes.
+      //       des autres causes.
       case "D3" =>
         isDelayed && (
           weatherOrNasMinutes > lit(0.0) || hasWeatherOrNasFlag
@@ -528,12 +703,40 @@ final class TrainRandomForest(
   // Sélection des features numériques
   // ---------------------------------------------------------------------------
 
+  /**
+   * Colonnes numériques utilisées comme features par le Random Forest.
+   *
+   * Référence article :
+   *   – le but est d’évaluer l’apport des données météo Wo/Wd par rapport
+   *     à un modèle basé uniquement sur les caractéristiques du vol,
+   *     sans fuite d’information depuis les causes de retard déjà observées.
+   *
+   * Important :
+   *   – on exclut explicitement toutes les colonnes qui contiennent
+   *     le label ou des informations de retard observé :
+   *       ARR_DELAY_NEW, WEATHER_DELAY, NAS_DELAY,
+   *       HAS_WEATHER_DELAY, HAS_NAS_DELAY.
+   *     Ces variables servent à définir D1–D4 (section 4.2), mais ne doivent
+   *     pas être utilisées comme features, sous peine de fuite de label.
+   */
   private def inferFeatureColumns(df: DataFrame): Array[String] = {
+    // Colonnes qui ne doivent pas être utilisées comme features :
+    //  - label binaire (target),
+    //  - délai observé (ARR_DELAY_NEW),
+    //  - date / timestamp bruts (on préfère dep_hour / dep_dow),
+    //  - colonnes de décomposition du retard par cause
+    //    (WEATHER_DELAY, NAS_DELAY, HAS_WEATHER_DELAY, HAS_NAS_DELAY),
+    //    qui servent à définir D1–D4 (article section 4.2)
+    //    mais ne sont pas disponibles "en temps réel" pour la prédiction.
     val excluded = Set(
       "label",
       "ARR_DELAY_NEW",
       "FL_DATE",
-      "CRS_DEP_TIMESTAMP"
+      "CRS_DEP_TIMESTAMP",
+      "WEATHER_DELAY",
+      "NAS_DELAY",
+      "HAS_WEATHER_DELAY",
+      "HAS_NAS_DELAY"
     )
 
     val numericCols = df.schema.fields.collect {
@@ -652,11 +855,11 @@ final class TrainRandomForest(
     val recallPos    = if (tp + fn > 0.0) tp / (tp + fn) else 0.0
     val specificity  = if (tn + fp > 0.0) tn / (tn + fp) else 0.0
 
-    log.info(f"[Train][$setName] Accuracy                 : $accuracy%1.4f")
-    log.info(f"[Train][$setName] F1                       : $f1%1.4f")
-    log.info(f"[Train][$setName] Precision (classe 1)     : $precisionPos%1.4f")
-    log.info(f"[Train][$setName] Recall (classe 1, Recd)  : $recallPos%1.4f")
-    log.info(f"[Train][$setName] Spécificité (classe 0, Reco) : $specificity%1.4f")
+    log.info(f"[Train][$setName] Accuracy                      : $accuracy%1.4f")
+    log.info(f"[Train][$setName] F1                            : $f1%1.4f")
+    log.info(f"[Train][$setName] Precision (classe 1)          : $precisionPos%1.4f")
+    log.info(f"[Train][$setName] Recall (classe 1, Recd)       : $recallPos%1.4f")
+    log.info(f"[Train][$setName] Spécificité (classe 0, Reco)  : $specificity%1.4f")
     log.info(s"[Train][$setName] Matrice de confusion (label,pred,count) : $confusion")
 
     BinaryMetrics(
