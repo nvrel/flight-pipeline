@@ -202,13 +202,12 @@ object Main {
         spark                = spark,
         flightCleanPath      = paths.flightCleanOut,
         weatherCleanPath     = paths.weatherCleanOut,
+        airportTimezonePath  = paths.airportTimezoneCleanOut,
         outIntermediate      = paths.joinIntermediateOut,
         outFlat              = paths.joinFlatOut(args.lags),
         windowHours          = args.windowHours,
         lags                 = args.lags
-      )
-
-      // Le résultat est écrit en Delta, pas besoin de conserver la DataFrame ici
+      )      // Le résultat est écrit en Delta, pas besoin de conserver la DataFrame ici
       joiner.run()
 
       log.info(s"[join] Terminé (lags=${args.lags})")

@@ -36,12 +36,13 @@ final class JoinFlightsWeather(
                                 spark: SparkSession,
                                 flightCleanPath: String,
                                 weatherCleanPath: String,
+                                airportTimezonePath: String,
                                 outIntermediate: String,
-                                outFlat: String,   // conservé pour un éventuel bloc "flat", désactivé
+                                outFlat: String,
                                 windowHours: Int,
                                 lags: Int
-                              ) {
-
+                              )
+{
   private val log = LoggerFactory.getLogger(getClass)
 
   /**
@@ -151,12 +152,34 @@ final class JoinFlightsWeather(
 
     var wSelAllPersisted: Option[DataFrame] = None
     var flightsPersisted: Option[DataFrame] = None
+    var airportTzPersisted: Option[DataFrame] = None
 
     // Par symétrie avec l’article, l’algorithme s’exprime plus clairement
     // avec un nombre de lags ≥ 1.
     val effectiveLags: Int = math.max(1, lags)
 
     try {
+      // ------------------------------------------------------------------
+      // 0) Référentiel AirportId -> TimeZone (Delta)
+      //
+      // Construit une seule fois dans WeatherRawToClean, on le réutilise
+      // ici pour convertir vols et météo en UTC avant d’appliquer la
+      // fenêtre de 12h (cf. article, sections 2.2–2.3).
+      // ------------------------------------------------------------------
+      sc.setJobDescription("Chargement du référentiel airport_timezone_clean")
+
+      val airportTz = spark.read
+        .format("delta")
+        .load(airportTimezonePath)
+        .select(
+          col("AirportId").cast("int").as("AirportId"),
+          col("TimeZone").cast("int").as("TimeZone")
+        )
+        .distinct()
+        .persist(StorageLevel.MEMORY_AND_DISK)
+
+      airportTzPersisted = Some(airportTz)
+
       // ------------------------------------------------------------------
       // 1) Vols : colonnes nécessaires et timestamps
       //
@@ -197,17 +220,32 @@ final class JoinFlightsWeather(
       val present  = flightsSrc.columns.toSet
       val keepCols = mustHave ++ optional.filter(present.contains)
 
-      val flights = flightsSrc
+      val flightsLocal = flightsSrc
         .select(keepCols.map(col): _*)
-        // tsa = tsd + durée planifiée (en secondes)
+
+      // Conversion des horaires planifiés en UTC à partir du fuseau de l'aéroport d'origine.
+      // Idée :
+      //   - CRS_DEP_TIMESTAMP est en heure locale origine (comme dans l’article pour tsd),
+      //   - on le passe en UTC via TimeZone,
+      //   - puis on ajoute CRS_ELAPSED_TIME pour obtenir l’instant d’arrivée en UTC.
+      val flights = flightsLocal
+        .join(
+          airportTz.withColumnRenamed("AirportId", "ORIGIN_AIRPORT_ID"),
+          Seq("ORIGIN_AIRPORT_ID"),
+          "left"
+        )
+        .withColumnRenamed("TimeZone", "TZ_ORIGIN")
+        // tsd_utc = tsd_local - TimeZone (ex : TimeZone = -5 → +5h pour aller en UTC)
+        .withColumn(
+          "CRS_DEP_TIMESTAMP",
+          expr("timestampadd(HOUR, -coalesce(TZ_ORIGIN, 0), CRS_DEP_TIMESTAMP)")
+        )
+        // tsa_utc = tsd_utc + durée planifiée (en secondes)
         .withColumn(
           "CRS_ARR_TIMESTAMP",
-          (col("CRS_DEP_TIMESTAMP").cast("long") +
-            (col("CRS_ELAPSED_TIME") * 60).cast("long"))
-            .cast("timestamp")
+          expr("timestampadd(SECOND, coalesce(CRS_ELAPSED_TIME, 0) * 60, CRS_DEP_TIMESTAMP)")
         )
-        // Identifiant technique de vol, plus simple à utiliser dans les
-        // jointures que les triplets (date, vol, compagnie).
+        .drop("TZ_ORIGIN")
         .withColumn("flight_id", monotonically_increasing_id())
         .repartition(col("ORIGIN_AIRPORT_ID"))
         .persist(StorageLevel.MEMORY_AND_DISK)
@@ -251,13 +289,22 @@ final class JoinFlightsWeather(
       // ------------------------------------------------------------------
       sc.setJobDescription("Chargement de la météo filtrée et sélection des variables")
 
-      val weatherBase = spark.read.format("delta").load(weatherCleanPath)
-        .where(col("timestamp").between(lit(minCut), lit(maxCut)))
+      // Lecture de la météo "clean" + jointure sur le fuseau de chaque aéroport
+      val weatherRaw = spark.read.format("delta").load(weatherCleanPath)
+        .join(airportTz, Seq("AirportId"), "left")
+        // Conversion du timestamp météo local -> UTC
+        .withColumn(
+          "w_ts_utc",
+          expr("timestampadd(HOUR, -coalesce(TimeZone, 0), timestamp)")
+        )
+
+      // Filtrage sur la fenêtre temporelle utile en UTC, comme pour les vols
+      val weatherBase = weatherRaw
+        .where(col("w_ts_utc").between(lit(minCut), lit(maxCut)))
         .repartition(col("AirportId"))
 
-      // Renommage du timestamp en `w_ts` pour clarifier son rôle dans
-      // Wo et Wd et éviter les conflits de noms.
-      val weatherWithTs = weatherBase.withColumnRenamed("timestamp", "w_ts")
+      // Renommage du timestamp UTC en `w_ts` pour Wo / Wd
+      val weatherWithTs = weatherBase.withColumnRenamed("w_ts_utc", "w_ts")
 
       val (wSelAll0, featureCols) = selectWeatherColumns(weatherWithTs)
       val wSelAll = wSelAll0.persist(StorageLevel.MEMORY_AND_DISK)
@@ -423,6 +470,7 @@ final class JoinFlightsWeather(
       // Libération explicite de la mémoire
       wSelAllPersisted.foreach(_.unpersist())
       flightsPersisted.foreach(_.unpersist())
+      airportTzPersisted.foreach(_.unpersist())
 
       // Retour de la table intermédiaire (utile pour les tests).
       spark.read.format("delta").load(outIntermediate)

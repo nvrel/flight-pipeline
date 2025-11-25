@@ -21,7 +21,7 @@
 
     <Loggers>
         <!-- Notre code : niveau INFO par défaut -->
-        <Logger name="flightpipeline" level="info" additivity="false">
+        <Logger name="flightpipeline" level="error" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>

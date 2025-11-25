@@ -4,12 +4,13 @@ import org.apache.spark.ml.{Pipeline, PipelineModel}
 import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
 import org.apache.spark.ml.evaluation.MulticlassClassificationEvaluator
 import org.apache.spark.ml.feature.VectorAssembler
-import org.apache.spark.sql.{Column, DataFrame, SparkSession}
+import org.apache.spark.sql.{Column, DataFrame, SparkSession, Row}
 import org.apache.spark.sql.functions._
-import org.apache.spark.sql.types.{ArrayType, NumericType, StructType}
+import org.apache.spark.sql.types.{ArrayType, NumericType, StructType, DoubleType, FloatType}
 import org.apache.spark.storage.StorageLevel
 import org.slf4j.LoggerFactory
 import java.lang.management.ManagementFactory
+
 
 import flightpipeline.eval.TrainRunLogger
 
@@ -102,34 +103,35 @@ final class TrainRandomForest(
    * La valeur passée au constructeur (featureSetId) est normalisée ici
    * pour absorber les variations de casse et de séparateurs.
    */
-  private val (normalizedFeatureSetId: String,
-  includeWeatherFeatures: Boolean,
-  articleWeatherFieldWhitelist: Option[Set[String]]) = {
+  private val (
+    normalizedFeatureSetId: String,
+    includeWeatherFeatures: Boolean,
+    articleWeatherFieldWhitelist: Option[Set[String]]
+    ) = {
 
     // Noyau des attributs météo correspondant aux variables citées dans l’article (section 2.3).
-    // Mapping informel :
+    // Mapping informel (d’après les noms de colonnes disponibles) :
     //   - T  → DryBulbFarenheit
     //   - H  → RelativeHumidity
     //   - Ws → WindSpeed
     //   - Wd → WindDirection
     //   - P  → SeaLevelPressure
-    //   - V  → Visibility
-    //   - S  → variables de couverture nuageuse (sky_*)
-    //   - Di → scores wt_score_* dérivés du descripteur de phénomènes
+    //   - V  → Visibility (string dans les données ; non utilisée telle quelle ici)
+    //   - S  → variables de couverture nuageuse (sky_*),
+    //   - Di → scores wt_score_* dérivés du descripteur de phénomènes.
     val articleWeatherCoreFields: Set[String] = Set(
-      // Thermiques / humidité / pression / vent / visibilité
+      // Thermiques / humidité / pression / vent
       "DryBulbFarenheit",
       "RelativeHumidity",
       "WindSpeed",
       "WindDirection",
       "SeaLevelPressure",
-      "Visibility",
-      // Sky condition (nuages / convection)
+      // S : proxy via paramètres de nébulosité
       "sky_num_layers",
       "sky_min_altitude",
       "sky_max_altitude",
       "sky_mean_altitude",
-      // Phénomènes météo (descripteur Di, pondéré)
+      // Di : phénomènes météo (pluie, neige, orages, brouillard, etc.)
       "wt_score_RA","wt_score_TS","wt_score_FG","wt_score_BR",
       "wt_score_FZ","wt_score_SN","wt_score_SH","wt_score_DZ"
     )
@@ -218,7 +220,8 @@ final class TrainRandomForest(
       // Référence : sections 2.2–3 de Belcastro et al.
       //   – "with-weather"      → extraction de toutes les séries météos Wo/Wd disponibles,
       //   – "no-weather"        → uniquement les features de vol,
-      //   – "article-weather"   → seulement les variables T, H, Wd, Ws, P, S, V, Di.
+      //   – "article-weather"   → seulement les variables T, H, Wd, Ws, P, S, V, Di,
+      //                           agrégées en indices Wo/Wd synthétiques.
       // ------------------------------------------------------------------
       val prepared = prepareBaseDataset(joined, includeWeatherFeatures)
 
@@ -375,19 +378,19 @@ final class TrainRandomForest(
   /**
    * Prépare le jeu de données pour le Random Forest.
    *
-   *  – colonnes de vol (date, horaires, aéroports),
-   *  – colonnes de retard (WEATHER_DELAY, NAS_DELAY, indicateurs),
-   *  – lags météo à l’origine et à destination Wo/Wd (si includeWeatherFeatures = true),
-   *  – variables temporelles simples (heure de départ, jour de la semaine),
-   *  – remplacement systématique des NULL numériques par 0.0.
+   *  - colonnes de vol (date, horaires, aéroports),
+   *  - colonnes de retard (WEATHER_DELAY, NAS_DELAY, indicateurs),
+   *  - lags météo à l'origine et à destination Wo/Wd (si includeWeatherFeatures = true),
+   *  - variables temporelles simples (heure de départ, jour de la semaine),
+   *  - traitement des NULL et NaN numériques.
    *
    * Lorsque includeWeatherFeatures = false, cette méthode construit un
    * jeu de features "baseline" sans météo, comme dans les expériences
-   * où l’article compare avec / sans variables météo.
+   * ou l'article compare avec / sans variables météo. :contentReference[oaicite:0]{index=0}
    *
    * Lorsque normalizedFeatureSetId = "article-weather", seules les
-   * variables météo correspondant à T, H, Wd, Ws, P, S, V et Di sont
-   * conservées dans Wo/Wd (cf. section 2.3 de l’article).
+   * variables météo correspondant à T, H, Ws, Wd, P, S et Di sont
+   * conservées via des indices Wo/Wd synthétiques (cf. section 2.3).
    */
   private def prepareBaseDataset(
                                   joined: DataFrame,
@@ -395,203 +398,369 @@ final class TrainRandomForest(
                                 ): DataFrame = {
 
     val sc = spark.sparkContext
-    sc.setJobDescription("TrainRF: préparation des colonnes de base")
+    sc.setJobDescription("TrainRF: preparation des colonnes de base")
+
+    // Fenêtre maximale de lags météo : capée à 7 comme dans le code d'origine.
+    val effectiveLags = math.min(lags, 7)
 
     // Colonnes de vol indispensables au label et aux features.
-    val baseCols = Seq(
+    val baseColNames = Seq(
       "FL_DATE",
       "CRS_DEP_TIMESTAMP",
       "CRS_ELAPSED_TIME",
       "ORIGIN_AIRPORT_ID",
       "DEST_AIRPORT_ID",
       "ARR_DELAY_NEW"
-    ).filter(joined.columns.contains).map(col)
+    ).filter(joined.columns.contains)
+
+    val baseCols = baseColNames.map(col)
 
     // Colonnes de retard nécessaires à la définition des jeux D1..D4
     // (article section 4.2, "Bad-weather delays detection").
-    val delayCols = Seq(
+    val delayColNames = Seq(
       "WEATHER_DELAY",
       "NAS_DELAY",
       "HAS_WEATHER_DELAY",
       "HAS_NAS_DELAY"
-    ).filter(joined.columns.contains).map(col)
+    ).filter(joined.columns.contains)
 
-    // Extraction ou non des lags météo Wo/Wd selon le mode choisi.
-    //
-    // Référence article :
-    //   – construction de Wo / Wd et des lags météo (sections 2.2–2.3),
-    //   – comparaison "with weather" / "without weather" (section 4),
-    //   – mode "article-weather" : restriction aux variables météo explicitement citées.
-    val weatherCols: Seq[Column] =
-      if (includeWeatherFeatures &&
-        joined.columns.contains("weather_origin") &&
-        joined.columns.contains("weather_dest")) {
+    val delayCols = delayColNames.map(col)
 
-        // Schéma d’un élément de weather_origin : struct<w_ts, ..., variables météo...>
-        val originStruct =
-          joined.schema("weather_origin").dataType
-            .asInstanceOf[ArrayType]
-            .elementType
-            .asInstanceOf[StructType]
+    val hasWeatherArrays =
+      joined.columns.contains("weather_origin") &&
+        joined.columns.contains("weather_dest")
 
-        // Candidats : tous les champs numériques de Wo/Wd (hors timestamp),
-        // soit les features produites par selectWeatherColumns côté join.
-        val candidateNumericFields: Seq[String] =
-          originStruct.fields
-            .filter(f => f.dataType.isInstanceOf[NumericType])
-            .map(_.name)
-            .filterNot(_ == "w_ts")
-
-        // Si le mode est "article-weather", on restreint cette liste
-        // au noyau T, H, Wd, Ws, P, S, V, Di.
-        val numericFields: Seq[String] =
-          articleWeatherFieldWhitelist match {
-            case Some(whitelist) =>
-              val filtered = candidateNumericFields.filter(whitelist.contains)
-              if (filtered.isEmpty) {
-                // Sécurité : si le schéma ne matche pas la whitelist (changement de noms),
-                // on loggue et on retombe sur tous les champs disponibles.
-                log.warn(
-                  "[Train] Mode article-weather : aucun champ météo commun entre le schéma et la whitelist, " +
-                    "utilisation de tous les champs numériques disponibles."
-                )
-                candidateNumericFields
-              } else {
-                log.info(
-                  s"[Train] Champs météo utilisés en mode article-weather (Wo/Wd) : ${filtered.sorted.mkString(", ")}"
-                )
-                filtered
-              }
-            case None =>
-              candidateNumericFields
-          }
-
-        // L’article montre qu’un historique d’environ 7 heures
-        // capture déjà bien la dynamique des phénomènes météo.
-        val effectiveLags = math.min(lags, 7)
-
-        def lagCols(prefix: String, arrayCol: String): Seq[Column] =
-          (0 until effectiveLags).flatMap { k =>
-            numericFields.map { f =>
-              col(arrayCol).getItem(k).getField(f).alias(s"${prefix}_${f}_lag$k")
-            }
-          }
-
-        lagCols("orig", "weather_origin") ++ lagCols("dest", "weather_dest")
-      } else {
-        if (!includeWeatherFeatures) {
-          // Mode baseline "sans météo" :
-          // aucune colonne dérivée de weather_origin / weather_dest
-          // n’est déployée. Le Random Forest ne voit que :
-          //   – FL_DATE, CRS_DEP_TIMESTAMP, CRS_ELAPSED_TIME,
-          //   – ORIGIN_AIRPORT_ID, DEST_AIRPORT_ID,
-          //   – variables horaires dérivées (heure, jour de semaine),
-          //   – colonnes de retard global (ARR_DELAY_NEW) et de cause.
-          log.info("[Train] Jeu de features sans météo : aucun lag Wo/Wd n’est extrait")
-        } else {
-          log.warn("[Train] Colonnes weather_origin / weather_dest absentes : aucun lag météo utilisable")
+    // Construction du bloc (vol + eventuelle météo), avant ajout des variables temporelles.
+    val withWeather: DataFrame =
+      if (!includeWeatherFeatures || !hasWeatherArrays) {
+        if (includeWeatherFeatures && !hasWeatherArrays) {
+          log.warn(
+            "[Train] includeWeatherFeatures=true mais colonnes weather_origin/weather_dest absentes : " +
+              "aucune feature meteo exploitable, retour au dataset sans meteo."
+          )
         }
-        Seq.empty[Column]
+        joined.select((baseCols ++ delayCols): _*)
+      } else {
+        normalizedFeatureSetId match {
+          case "article-weather" =>
+            // Mode article-weather : indices Wo_*/Wd_* synthétiques alignés sur T, H, Ws, Wd, P, S, Di.
+            buildArticleWeatherDataset(joined, baseCols, delayCols, effectiveLags)
+
+          case _ =>
+            // Mode with-weather : comportement "full" historique, tous les lags Wo/Wd détaillés.
+            buildFullWeatherLagDataset(joined, baseCols, delayCols, effectiveLags)
+        }
       }
 
-    val baseWithWeather =
-      joined
-        .select((baseCols ++ delayCols ++ weatherCols): _*)
+    val baseWithTime =
+      withWeather
         // Variables temporelles simples (heure de départ, jour de la semaine).
         .withColumn("dep_hour", hour(col("CRS_DEP_TIMESTAMP")))
         .withColumn("dep_dow",  dayofweek(col("FL_DATE")))
 
     // Les lignes sans ARR_DELAY_NEW ne permettent pas de construire un label binaire.
-    val cleaned = baseWithWeather.filter(col("ARR_DELAY_NEW").isNotNull)
+    val cleaned = baseWithTime.filter(col("ARR_DELAY_NEW").isNotNull)
 
-    // Remplacement homogène des NULL numériques par 0.0 pour éviter les
-    // problèmes dans VectorAssembler.
-    val numericCols = cleaned.schema.fields.collect {
+    // Remplacement des NULL numeriques.
+    //
+    // - En mode "no-weather" ou "with-weather", on remplit toutes les colonnes
+    //   numeriques a 0.0 (comportement historique).
+    // - En mode "article-weather", on evite d'ecraser les indices Wo_*/Wd_ :
+    //   les flags *_missing portent l'information de presence/absence de meteo.
+    val allNumericCols = cleaned.schema.fields.collect {
       case f if f.dataType.isInstanceOf[NumericType] => f.name
     }
 
-    val cleanedNoNulls =
-      if (numericCols.nonEmpty)
-        cleaned.na.fill(0.0, numericCols)
-      else
+    val cleanedNoNulls: DataFrame =
+      if (allNumericCols.isEmpty) {
         cleaned
+      } else if (normalizedFeatureSetId == "article-weather") {
+        // On ne remplit pas les colonnes Wo_*/Wd_ ici, uniquement les autres.
+        val weatherFeatureNames = allNumericCols.filter { name =>
+          name.startsWith("Wo_") || name.startsWith("Wd_")
+        }
+        val nonWeatherNumericCols =
+          allNumericCols.filterNot(weatherFeatureNames.toSet)
 
-    val nClean = cleanedNoNulls.count()
+        if (nonWeatherNumericCols.nonEmpty)
+          cleaned.na.fill(0.0, nonWeatherNumericCols)
+        else
+          cleaned
+      } else {
+        // with-weather / no-weather : remplissage 0.0 de toutes les colonnes numeriques.
+        cleaned.na.fill(0.0, allNumericCols)
+      }
+
+    // Nettoyage des NaN / Inf dans les colonnes flottantes.
+    //
+    // Le RandomForest de Spark n'accepte ni NaN ni Inf dans le vecteur de features.
+    // Or certaines colonnes meteo contiennent des NaN (valeurs manquantes encodees
+    // en NaN dans les CSV d'origine). :contentReference[oaicite:1]{index=1}
+    //
+    // On remplace donc, pour toutes les colonnes Double/Float :
+    //   - NaN            -> 0.0
+    //   - +Infinity/-Inf -> 0.0
+    //
+    // Ce traitement est applique a tous les modes de features
+    // (with-weather, no-weather, article-weather).
+    val floatDoubleCols: Array[String] =
+      cleanedNoNulls.schema.fields.collect {
+        case f if f.dataType == DoubleType || f.dataType == FloatType => f.name
+      }
+
+    val cleanedFinal =
+      floatDoubleCols.foldLeft(cleanedNoNulls) { (df, name) =>
+        df.withColumn(
+          name,
+          when(
+            isnan(col(name)) ||
+              col(name) === lit(Double.PositiveInfinity) ||
+              col(name) === lit(Double.NegativeInfinity),
+            lit(0.0)
+          ).otherwise(col(name))
+        )
+      }
+
+    val nClean = cleanedFinal.count()
     log.info(
-      s"[Train] Dataset après préparation (includeWeather=$includeWeatherFeatures, featureSet=$normalizedFeatureSetId) : " +
-        s"$nClean lignes, ${cleanedNoNulls.columns.length} colonnes"
+      s"[Train] Dataset apres preparation (includeWeather=$includeWeatherFeatures, featureSet=$normalizedFeatureSetId) : " +
+        s"$nClean lignes, ${cleanedFinal.columns.length} colonnes"
     )
 
-    cleanedNoNulls
+    cleanedFinal
+  }
+
+
+  /**
+   * Mode "with-weather" : déploie toutes les séries Wo/Wd en colonnes de lag.
+   *
+   * On garde le comportement d’origine :
+   *   – tous les champs numériques des structs météo (hors w_ts)
+   *   – lags 0..effectiveLags-1 à l’origine et à destination,
+   *   – alias orig_<champ>_lagK et dest_<champ>_lagK.
+   *
+   * Le traitement des NULL (0.0 vs NaN) est géré plus haut dans prepareBaseDataset.
+   */
+  private def buildFullWeatherLagDataset(
+                                          joined: DataFrame,
+                                          baseCols: Seq[Column],
+                                          delayCols: Seq[Column],
+                                          effectiveLags: Int
+                                        ): DataFrame = {
+
+    val originStruct =
+      joined.schema("weather_origin").dataType
+        .asInstanceOf[ArrayType]
+        .elementType
+        .asInstanceOf[StructType]
+
+    val numericFields: Seq[String] =
+      originStruct.fields
+        .filter(f => f.dataType.isInstanceOf[NumericType])
+        .map(_.name)
+        .filterNot(_ == "w_ts")
+
+    log.info(
+      s"[Train] Champs météo numériques Wo/Wd (with-weather) : ${numericFields.sorted.mkString(", ")}"
+    )
+
+    def lagCols(prefix: String, arrayCol: String): Seq[Column] =
+      (0 until effectiveLags).flatMap { k =>
+        numericFields.map { f =>
+          col(arrayCol).getItem(k).getField(f).alias(s"${prefix}_${f}_lag$k")
+        }
+      }
+
+    val weatherCols =
+      lagCols("orig", "weather_origin") ++ lagCols("dest", "weather_dest")
+
+    joined.select((baseCols ++ delayCols ++ weatherCols): _*)
+  }
+
+  /**
+   * Mode "article-weather" aligné sur la section 2.3 de l’article (Belcastro et al., TIST 2016).
+   *
+   * Ce mode expose explicitement, pour chaque vol, les variables météo d’origine (Wo_*)
+   * et de destination (Wd_*) suivantes, pour les 7 heures précédant le vol (lags 0 à 6) :
+   * – T : température (Wo_T_lag0, ..., Wo_T_lag6)
+   * – H : humidité relative
+   * – Ws : vitesse du vent
+   * – Wd : direction du vent
+   * – P : pression au niveau de la mer
+   * – S : nébulosité maximale (couche la plus dense)
+   * – V : distance de visibilité
+   * – Di : indice de sévérité météo (score cumulé sur RA, TS, FG, BR, FZ, SN, SH, DZ)
+   *
+   * Contrairement à la version précédente qui faisait une moyenne glissante,
+   * on expose ici chaque observation horaire distinctement, comme suggéré dans l’article
+   * (mentions explicites de tests sur fenêtres 0 à 11 heures).
+   *
+   * Pour chaque feature, on ajoute :
+   * – un flag *_missing pour signaler l’absence de données (NULL),
+   * – une valeur imputée par défaut pour éviter les NULL dans le vecteur de features.
+   */
+  private def buildArticleWeatherDataset(base: DataFrame, baseCols: Seq[Column], delayCols: Seq[Column], effectiveLags: Int): DataFrame = {
+    val maxLag = math.min(effectiveLags - 1, 6) // Cap à lag6
+
+
+    var df = base.select((baseCols ++ delayCols :+ col("weather_origin") :+ col("weather_dest")): _*)
+
+
+    // Boucle sur les 7 lags horaires (0 à 6)
+    for (lag <- 0 to maxLag) {
+      val origin = col("weather_origin").getItem(lag)
+      val dest = col("weather_dest").getItem(lag)
+
+
+      df = df
+        // Origine : T, H, Ws, Wd, P
+        .withColumn(s"Wo_T_lag$lag", origin.getField("DryBulbFarenheit"))
+        .withColumn(s"Wo_H_lag$lag", origin.getField("RelativeHumidity"))
+        .withColumn(s"Wo_Ws_lag$lag", origin.getField("WindSpeed"))
+        .withColumn(s"Wo_Wd_lag$lag", origin.getField("WindDirection"))
+        .withColumn(s"Wo_P_lag$lag", origin.getField("SeaLevelPressure"))
+        // Couverture nuageuse maximale (max des altitudes rapportées)
+        .withColumn(s"Wo_S_lag$lag", origin.getField("sky_num_layers"))
+        // Visibilité transformée en distance (assumer champ prétraité si besoin)
+        .withColumn(s"Wo_visibility_lag$lag", origin.getField("Visibility"))
+        // Di = score cumulé des phéno météo horaires
+        .withColumn(s"Wo_Di_lag$lag", sumWeatherScores(origin))
+
+
+        // Destination
+        .withColumn(s"Wd_T_lag$lag", dest.getField("DryBulbFarenheit"))
+        .withColumn(s"Wd_H_lag$lag", dest.getField("RelativeHumidity"))
+        .withColumn(s"Wd_Ws_lag$lag", dest.getField("WindSpeed"))
+        .withColumn(s"Wd_Wd_lag$lag", dest.getField("WindDirection"))
+        .withColumn(s"Wd_P_lag$lag", dest.getField("SeaLevelPressure"))
+        .withColumn(s"Wd_S_lag$lag", dest.getField("sky_num_layers"))
+        .withColumn(s"Wd_visibility_lag$lag", dest.getField("Visibility"))
+        .withColumn(s"Wd_Di_lag$lag", sumWeatherScores(dest))
+    }
+
+
+    // Ajout des flags *_missing et remplacement des NULLs par valeur de repli (e.g. 0.0)
+    val vars = Seq("T", "H", "Ws", "Wd", "P", "S", "visibility", "Di")
+    val features = vars.flatMap(v => (0 to maxLag).flatMap(lag => Seq(s"Wo_${v}_lag$lag", s"Wd_${v}_lag$lag")))
+
+
+    features.foldLeft(df) { (acc, name) =>
+      acc.withColumn(s"${name}_missing", when(col(name).isNull, 1.0).otherwise(0.0))
+        .withColumn(name, coalesce(col(name), lit(0.0)))
+    }
+  }
+
+
+  /**
+   * Construit un score Di horaire (cf. article section 2.3) en sommant les scores
+   * météorologiques associés aux phénomènes significatifs :
+   * pluie (RA), orages (TS), brouillard (FG/BR), verglas (FZ), neige (SN), etc.
+   *
+   * L’idée est de produire un score agrégé d’intensité météo par observation horaire.
+   * Si tous les champs sont nuls ou absents, on renvoie NULL.
+   */
+  private def sumWeatherScores(row: Column): Column = {
+    val fields = Seq("wt_score_RA", "wt_score_TS", "wt_score_FG", "wt_score_BR",
+      "wt_score_FZ", "wt_score_SN", "wt_score_SH", "wt_score_DZ")
+    fields.map(row.getField).reduce(_ + _)
   }
 
   // ---------------------------------------------------------------------------
-  // Sélection des vols positifs pour D1..D4 (section 4.2)
+  // Sélection des vols positifs pour D1..D4 (section 4.2 de l’article TIST)
   // ---------------------------------------------------------------------------
 
   /**
-   * Condition qui identifie la classe positive (label = 1.0)
-   * en fonction du jeu D1..D4 ciblé.
+   * Détermine si un vol est classé comme "positif" (retard significatif dû à la météo)
+   * selon la définition du jeu D1, D2, D3 ou D4, utilisée dans les expériences de l’article.
    *
-   * Traduction en SQL des définitions de la section 4.2 :
-   *   – D1 : retards presque entièrement dus à la météo ou NAS,
-   *   – D2 : retards avec composante météo ou NAS_DELAY ≥ seuil,
-   *   – D3 : retards où la météo ou NAS interviennent, même avec d’autres causes,
-   *   – D4 : tous les retards (ARR_DELAY_NEW ≥ seuil),
-   *   – ALL : comportement large similaire à D3.
+   * L'article (Belcastro et al., TIST 2016, section 4.2, p.5-6) distingue soigneusement :
+   *   - les retards "vraiment" liés à la météo,
+   *   - la part de NAS_DELAY causée par des événements météo (estimée à 58.3 % en 2013),
+   *   - les autres causes (Late Aircraft, Carrier Delay, etc.).
+   *
+   * Cette fonction reproduit fidèlement ces définitions, avec le facteur correcteur
+   * appliqué à NAS_DELAY pour refléter la part imputable à la météo (nasWeatherFactor).
+   *
+   * @param datasetId  nom du jeu ciblé (D1, D2, D3, D4 ou ALL)
+   * @param threshold  seuil en minutes pour considérer un vol comme "retardé" (ex. 60)
    */
   private def positiveFilterForDataset(datasetId: String,
                                        threshold: Double): Column = {
 
+    // Valeurs de base
     val delayMinutes   = coalesce(col("ARR_DELAY_NEW"), lit(0.0))
     val weatherMinutes = coalesce(col("WEATHER_DELAY"), lit(0.0))
     val nasMinutes     = coalesce(col("NAS_DELAY"), lit(0.0))
 
-    val hasWeatherFlag =
-      coalesce(col("HAS_WEATHER_DELAY").cast("boolean"), lit(false))
-    val hasNasFlag =
-      coalesce(col("HAS_NAS_DELAY").cast("boolean"), lit(false))
+    // Flags (HAS_NAS_DELAY, HAS_WEATHER_DELAY) parfois utiles pour robustesse
+    val hasWeatherFlag = coalesce(col("HAS_WEATHER_DELAY").cast("boolean"), lit(false))
+    val hasNasFlag     = coalesce(col("HAS_NAS_DELAY").cast("boolean"), lit(false))
 
+    // Retard total jugé significatif (ex. ≥ 60 min)
     val isDelayed = delayMinutes >= lit(threshold)
 
-    val weatherOrNasMinutes = weatherMinutes + nasMinutes
+    // ⚠️ Correction apportée au NAS_DELAY pour refléter uniquement la part météo
+    // L’article dit que 58.3 % des retards NAS sont liés à la météo (page 6, tableau V)
+    // Cette part est fixe dans les données FAA 2013, utilisée comme référence pour 2012 aussi.
+    val nasWeatherFactor = 0.583
+    val nasWeatherMinutes = nasMinutes * nasWeatherFactor
+
+    // Somme des minutes météo : WEATHER_DELAY + part NAS liée à la météo
+    val weatherTotal = weatherMinutes + nasWeatherMinutes
+
+    // Heuristique supplémentaire utilisée dans l’article : "hasWeatherOrNasFlag"
     val hasWeatherOrNasFlag = hasWeatherFlag || hasNasFlag
 
-    // Estimation simple des minutes imputables à d’autres causes.
-    val otherCauseMinutes = delayMinutes - weatherOrNasMinutes
+    // Estimation des minutes dues à d'autres causes
+    val otherCauseMinutes = delayMinutes - weatherTotal
 
+    // Cas spécifiques pour chaque dataset
     datasetId.toUpperCase match {
 
-      // D1 : retards expliqués quasi entièrement par météo/NAS.
+      // ---------------------------------------------------------------------
+      // D1 – "Retards quasi entièrement dus à la météo ou NAS lié à météo"
+      // Article : "flights for which delay is almost completely caused by weather or NAS related to weather"
+      // ---------------------------------------------------------------------
       case "D1" =>
         isDelayed &&
-          (weatherOrNasMinutes > lit(0.0) || hasWeatherOrNasFlag) &&
-          (otherCauseMinutes <= lit(0.5))
+          (weatherTotal > 0.0 || hasWeatherOrNasFlag) &&
+          (otherCauseMinutes <= 0.5)
 
-      // D2 : retards météo OU retards avec NAS_DELAY ≥ seuil.
+      // ---------------------------------------------------------------------
+      // D2 – "Retards causés par météo OU NAS_DELAY (lié à météo) ≥ seuil"
+      // Article : "NAS delay greater than or equal to threshold" (avec correction météo)
+      // ---------------------------------------------------------------------
       case "D2" =>
         isDelayed && (
-          weatherMinutes > lit(0.0) ||
-            nasMinutes    >= lit(threshold)
+          weatherMinutes > 0.0 ||
+            nasWeatherMinutes >= threshold
           )
 
-      // D3 : retards où météo ou NAS interviennent, quelle que soit la part
-      //       des autres causes.
+      // ---------------------------------------------------------------------
+      // D3 – "Retards où météo ou NAS lié à météo interviennent"
+      // Article : "flights delayed by weather or by NAS related to weather"
+      // ---------------------------------------------------------------------
       case "D3" =>
         isDelayed && (
-          weatherOrNasMinutes > lit(0.0) || hasWeatherOrNasFlag
+          weatherTotal > 0.0 || hasWeatherOrNasFlag
           )
 
-      // D4 : tous les vols retardés.
+      // ---------------------------------------------------------------------
+      // D4 – Tous les vols retardés, sans distinction de cause
+      // Article : "includes all delayed flights with no filtering on delay causes"
+      // ---------------------------------------------------------------------
       case "D4" =>
         isDelayed
 
-      // ALL : comportement large centré météo/NAS, proche de D3.
+      // ---------------------------------------------------------------------
+      // ALL – Comportement proche de D3, équivalent dans notre implémentation
+      // ---------------------------------------------------------------------
       case "ALL" | "D_ALL" =>
         isDelayed && (
-          weatherOrNasMinutes > lit(0.0) || hasWeatherOrNasFlag
+          weatherTotal > 0.0 || hasWeatherOrNasFlag
           )
 
+      // Sécurité : dataset non reconnu
       case other =>
         throw new IllegalArgumentException(
           s"[TrainRandomForest] Dataset de retard inconnu : '$other' " +
@@ -764,6 +933,9 @@ final class TrainRandomForest(
     val sc = spark.sparkContext
     sc.setJobDescription("TrainRF: entraînement du Random Forest")
 
+    // On caste explicitement toutes les features en double. Les NaN éventuels
+    // (issus du remplissage des colonnes météo en mode with-weather) sont
+    // transmis tels quels au Random Forest, qui sait les gérer dans les splits.
     val casted = featureCols.foldLeft(trainDF) { (df, c) =>
       df.withColumn(c, col(c).cast("double"))
     }
