@@ -11,7 +11,6 @@ import org.apache.spark.storage.StorageLevel
 import org.slf4j.LoggerFactory
 import java.lang.management.ManagementFactory
 
-
 import flightpipeline.eval.TrainRunLogger
 
 /**
@@ -79,92 +78,184 @@ final class TrainRandomForest(
   }
 
   /**
-   * Choix du jeu de features :
+   * Noyau des attributs météo correspondant aux variables citées dans l’article (section 2.3).
+   * Mapping informel (d’après les noms de colonnes disponibles) :
+   *   - T  → DryBulbFarenheit
+   *   - H  → RelativeHumidity
+   *   - Ws → WindSpeed
+   *   - Wd → WindDirection
+   *   - P  → SeaLevelPressure
+   *   - V  → Visibility (string dans les données ; non utilisée telle quelle ici)
+   *   - S  → variables de couverture nuageuse (sky_*),
+   *   - Di → scores wt_score_* dérivés du descripteur de phénomènes.
    *
-   *   – "with-weather"    : vol + toutes les features météo Wo/Wd produites
-   *                         par `JoinFlightsWeather` (liste complète de selectWeatherColumns).
+   * Ce set sert de documentation pour le mode "article-weather" et peut être
+   * utilisé si l’on souhaite filtrer explicitement les champs météo à l’avenir.
+   */
+  private val articleWeatherCoreFields: Set[String] = Set(
+    // Thermiques / humidité / pression / vent
+    "DryBulbFarenheit",
+    "RelativeHumidity",
+    "WindSpeed",
+    "WindDirection",
+    "SeaLevelPressure",
+    // S : proxy via paramètres de nébulosité
+    "sky_num_layers",
+    "sky_min_altitude",
+    "sky_max_altitude",
+    "sky_mean_altitude",
+    // Di : phénomènes météo (pluie, neige, orages, brouillard, etc.)
+    "wt_score_RA","wt_score_TS","wt_score_FG","wt_score_BR",
+    "wt_score_FZ","wt_score_SN","wt_score_SH","wt_score_DZ"
+  )
+
+  /**
+   * Modélisation explicite des trois jeux de features possibles.
    *
-   *   – "no-weather"      : modèle de référence qui ne voit que les caractéristiques
-   *                         du vol (aéroports, horaires, etc.), comme dans la
-   *                         section expérimentale où l’article montre qu’un modèle
-   *                         sans météo fait déjà mieux que le hasard grâce à l’effet
-   *                         "aéroport" et à quelques variables de vol.
+   *   – WithWeather    : vol + toutes les features météo Wo/Wd produites
+   *                      par `JoinFlightsWeather` (liste complète de selectWeatherColumns).
    *
-   *   – "article-weather" : jeu de features météo restreint aux variables décrites
-   *                         explicitement dans la section 2.3 de l’article :
-   *                           T (température),
-   *                           H (humidité),
-   *                           Wd/Ws (direction / vitesse du vent),
-   *                           P (pression barométrique),
-   *                           S (sky condition),
-   *                           V (visibilité),
-   *                           Di (descripteur de phénomènes météo).
+   *   – NoWeather      : modèle de référence qui ne voit que les caractéristiques
+   *                      du vol (aéroports, horaires, etc.), comme dans la
+   *                      section expérimentale où l’article montre qu’un modèle
+   *                      sans météo fait déjà mieux que le hasard grâce à l’effet
+   *                      "aéroport" et à quelques variables de vol.
+   *
+   *   – ArticleWeather : jeu de features météo restreint aux variables décrites
+   *                      explicitement dans la section 2.3 de l’article :
+   *                        T (température),
+   *                        H (humidité),
+   *                        Wd/Ws (direction / vitesse du vent),
+   *                        P (pression barométrique),
+   *                        S (sky condition),
+   *                        V (visibilité),
+   *                        Di (descripteur de phénomènes météo).
    *
    * La valeur passée au constructeur (featureSetId) est normalisée ici
-   * pour absorber les variations de casse et de séparateurs.
+   * pour absorber les variations de casse et de séparateurs, puis
+   * convertie en une instance de FeatureSetMode.
    */
-  private val (
-    normalizedFeatureSetId: String,
-    includeWeatherFeatures: Boolean,
-    articleWeatherFieldWhitelist: Option[Set[String]]
-    ) = {
+  private sealed trait FeatureSetMode {
+    def id: String
+    def includeWeather: Boolean
+  }
+  private case object WithWeather extends FeatureSetMode {
+    val id: String = "with-weather"
+    val includeWeather: Boolean = true
+  }
+  private case object NoWeather extends FeatureSetMode {
+    val id: String = "no-weather"
+    val includeWeather: Boolean = false
+  }
+  private case object ArticleWeather extends FeatureSetMode {
+    val id: String = "article-weather"
+    val includeWeather: Boolean = true
+  }
 
-    // Noyau des attributs météo correspondant aux variables citées dans l’article (section 2.3).
-    // Mapping informel (d’après les noms de colonnes disponibles) :
-    //   - T  → DryBulbFarenheit
-    //   - H  → RelativeHumidity
-    //   - Ws → WindSpeed
-    //   - Wd → WindDirection
-    //   - P  → SeaLevelPressure
-    //   - V  → Visibility (string dans les données ; non utilisée telle quelle ici)
-    //   - S  → variables de couverture nuageuse (sky_*),
-    //   - Di → scores wt_score_* dérivés du descripteur de phénomènes.
-    val articleWeatherCoreFields: Set[String] = Set(
-      // Thermiques / humidité / pression / vent
-      "DryBulbFarenheit",
-      "RelativeHumidity",
-      "WindSpeed",
-      "WindDirection",
-      "SeaLevelPressure",
-      // S : proxy via paramètres de nébulosité
-      "sky_num_layers",
-      "sky_min_altitude",
-      "sky_max_altitude",
-      "sky_mean_altitude",
-      // Di : phénomènes météo (pluie, neige, orages, brouillard, etc.)
-      "wt_score_RA","wt_score_TS","wt_score_FG","wt_score_BR",
-      "wt_score_FZ","wt_score_SN","wt_score_SH","wt_score_DZ"
-    )
+  private object FeatureSetMode {
 
-    val norm = Option(featureSetId)
-      .getOrElse("with-weather")
-      .trim
-      .toLowerCase
-      .replace(' ', '-')
-      .replace('_', '-')
+    /**
+     * Normalise la chaîne passée au constructeur (featureSetId) et la
+     * mappe sur l’un des trois modes supportés.
+     */
+    def fromId(raw: String): FeatureSetMode = {
+      val norm = Option(raw)
+        .getOrElse("with-weather")
+        .trim
+        .toLowerCase
+        .replace(' ', '-')
+        .replace('_', '-')
 
-    norm match {
-      case "with-weather" | "withweather" | "weather" | "full" =>
-        log.info("[Train] Jeu de features = with-weather (vol + toutes les features météo Wo/Wd)")
-        ("with-weather", true, None)
+      norm match {
+        case "with-weather" | "withweather" | "weather" | "full" =>
+          log.info("[Train] Jeu de features = with-weather (vol + toutes les features météo Wo/Wd)")
+          WithWeather
 
-      case "no-weather" | "noweather" | "baseline" | "sans-meteo" | "sansmeteo" =>
-        log.info("[Train] Jeu de features = no-weather (vol uniquement, baseline sans météo)")
-        ("no-weather", false, None)
+        case "no-weather" | "noweather" | "baseline" | "sans-meteo" | "sansmeteo" =>
+          log.info("[Train] Jeu de features = no-weather (vol uniquement, baseline sans météo)")
+          NoWeather
 
-      case "article-weather" | "articleweather" | "article" | "paper-weather" =>
-        log.info(
-          "[Train] Jeu de features = article-weather " +
-            "(vol + sous-ensemble météo aligné sur T, H, Wd, Ws, P, S, V, Di de l’article)"
-        )
-        ("article-weather", true, Some(articleWeatherCoreFields))
+        case "article-weather" | "articleweather" | "article" | "paper-weather" =>
+          log.info(
+            "[Train] Jeu de features = article-weather " +
+              "(vol + sous-ensemble météo aligné sur T, H, Wd, Ws, P, S, V, Di de l’article)"
+          )
+          log.info(
+            s"[Train] Noyau de champs météo (article-weather) : " +
+              articleWeatherCoreFields.mkString(", ")
+          )
+          ArticleWeather
 
-      case other =>
-        log.warn(
-          s"[Train] Jeu de features inconnu '$other', utilisation de 'with-weather' par défaut"
-        )
-        ("with-weather", true, None)
+        case other =>
+          log.warn(
+            s"[Train] Jeu de features inconnu '$other', utilisation de 'with-weather' par défaut"
+          )
+          WithWeather
+      }
     }
+  }
+
+  /** Mode de features utilisé pour ce run (normalisé). */
+  private val mode: FeatureSetMode = FeatureSetMode.fromId(featureSetId)
+
+  /** Identifiant normalisé du jeu de features (utilisé dans les logs et la table de runs). */
+  private val normalizedFeatureSetId: String = mode.id
+
+  /**
+   * Hyperparamètres du Random Forest, éventuellement adaptés
+   * au jeu de features (with-weather / no-weather / article-weather).
+   *
+   * L’idée est de conserver l’esprit de l’article (section 4.3) :
+   *   – nombre d’arbres suffisant,
+   *   – profondeur contrôlée,
+   *   – sous-échantillonnage,
+   * tout en tenant compte de la taille du vecteur de features :
+   *   – petit pour no-weather,
+   *   – plus riche pour with-weather / article-weather.
+   */
+  private case class RfHyperParams(
+                                    numTrees: Int,
+                                    maxDepth: Int,
+                                    minInstancesPerNode: Int,
+                                    subsamplingRate: Double,
+                                    featureSubsetStrategy: String = "sqrt",
+                                    seed: Long = 42L
+                                  )
+
+  /**
+   * Table de correspondance (mode -> hyperparamètres RF).
+   *
+   * Ces valeurs sont des points de départ raisonnables :
+   *   – no-weather    : vecteur de features compact → modèle plus léger,
+   *   – with-weather  : beaucoup de lags météo Wo/Wd → davantage d’arbres,
+   *   – article-weather : sous-ensemble météo ciblé → un peu plus d’arbres / profondeur.
+   *
+   * Elles peuvent être ajustées en fonction des temps de calcul et des résultats observés.
+   */
+  private def rfHyperParamsFor(mode: FeatureSetMode): RfHyperParams = mode match {
+    case NoWeather =>
+      RfHyperParams(
+        numTrees            = 80,
+        maxDepth            = 12,
+        minInstancesPerNode = 100,
+        subsamplingRate     = 0.7
+      )
+
+    case WithWeather =>
+      RfHyperParams(
+        numTrees            = 150,
+        maxDepth            = 16,
+        minInstancesPerNode = 50,
+        subsamplingRate     = 0.7
+      )
+
+    case ArticleWeather =>
+      RfHyperParams(
+        numTrees            = 200,
+        maxDepth            = 18,
+        minInstancesPerNode = 30,
+        subsamplingRate     = 0.8
+      )
   }
 
   /**
@@ -223,7 +314,7 @@ final class TrainRandomForest(
       //   – "article-weather"   → seulement les variables T, H, Wd, Ws, P, S, V, Di,
       //                           agrégées en indices Wo/Wd synthétiques.
       // ------------------------------------------------------------------
-      val prepared = prepareBaseDataset(joined, includeWeatherFeatures)
+      val prepared = prepareBaseDataset(joined)
 
       // ------------------------------------------------------------------
       // 3. Construction des jeux train/test équilibrés
@@ -380,21 +471,20 @@ final class TrainRandomForest(
    *
    *  - colonnes de vol (date, horaires, aéroports),
    *  - colonnes de retard (WEATHER_DELAY, NAS_DELAY, indicateurs),
-   *  - lags météo à l'origine et à destination Wo/Wd (si includeWeatherFeatures = true),
+   *  - lags météo à l'origine et à destination Wo/Wd (si le mode inclut la météo),
    *  - variables temporelles simples (heure de départ, jour de la semaine),
    *  - traitement des NULL et NaN numériques.
    *
-   * Lorsque includeWeatherFeatures = false, cette méthode construit un
+   * Lorsque le mode courant est "no-weather", cette méthode construit un
    * jeu de features "baseline" sans météo, comme dans les expériences
-   * ou l'article compare avec / sans variables météo. :contentReference[oaicite:0]{index=0}
+   * où l'article compare avec / sans variables météo.
    *
    * Lorsque normalizedFeatureSetId = "article-weather", seules les
    * variables météo correspondant à T, H, Ws, Wd, P, S et Di sont
    * conservées via des indices Wo/Wd synthétiques (cf. section 2.3).
    */
   private def prepareBaseDataset(
-                                  joined: DataFrame,
-                                  includeWeatherFeatures: Boolean
+                                  joined: DataFrame
                                 ): DataFrame = {
 
     val sc = spark.sparkContext
@@ -430,19 +520,19 @@ final class TrainRandomForest(
       joined.columns.contains("weather_origin") &&
         joined.columns.contains("weather_dest")
 
-    // Construction du bloc (vol + eventuelle météo), avant ajout des variables temporelles.
+    // Construction du bloc (vol + éventuelle météo), avant ajout des variables temporelles.
     val withWeather: DataFrame =
-      if (!includeWeatherFeatures || !hasWeatherArrays) {
-        if (includeWeatherFeatures && !hasWeatherArrays) {
+      if (!mode.includeWeather || !hasWeatherArrays) {
+        if (mode.includeWeather && !hasWeatherArrays) {
           log.warn(
-            "[Train] includeWeatherFeatures=true mais colonnes weather_origin/weather_dest absentes : " +
+            "[Train] mode.includeWeather=true mais colonnes weather_origin/weather_dest absentes : " +
               "aucune feature meteo exploitable, retour au dataset sans meteo."
           )
         }
         joined.select((baseCols ++ delayCols): _*)
       } else {
-        normalizedFeatureSetId match {
-          case "article-weather" =>
+        mode match {
+          case ArticleWeather =>
             // Mode article-weather : indices Wo_*/Wd_* synthétiques alignés sur T, H, Ws, Wd, P, S, Di.
             buildArticleWeatherDataset(joined, baseCols, delayCols, effectiveLags)
 
@@ -495,7 +585,7 @@ final class TrainRandomForest(
     //
     // Le RandomForest de Spark n'accepte ni NaN ni Inf dans le vecteur de features.
     // Or certaines colonnes meteo contiennent des NaN (valeurs manquantes encodees
-    // en NaN dans les CSV d'origine). :contentReference[oaicite:1]{index=1}
+    // en NaN dans les CSV d'origine).
     //
     // On remplace donc, pour toutes les colonnes Double/Float :
     //   - NaN            -> 0.0
@@ -523,13 +613,12 @@ final class TrainRandomForest(
 
     val nClean = cleanedFinal.count()
     log.info(
-      s"[Train] Dataset apres preparation (includeWeather=$includeWeatherFeatures, featureSet=$normalizedFeatureSetId) : " +
+      s"[Train] Dataset apres preparation (featureSet=$normalizedFeatureSetId, includeWeather=${mode.includeWeather}) : " +
         s"$nClean lignes, ${cleanedFinal.columns.length} colonnes"
     )
 
     cleanedFinal
   }
-
 
   /**
    * Mode "with-weather" : déploie toutes les séries Wo/Wd en colonnes de lag.
@@ -599,18 +688,20 @@ final class TrainRandomForest(
    * – un flag *_missing pour signaler l’absence de données (NULL),
    * – une valeur imputée par défaut pour éviter les NULL dans le vecteur de features.
    */
-  private def buildArticleWeatherDataset(base: DataFrame, baseCols: Seq[Column], delayCols: Seq[Column], effectiveLags: Int): DataFrame = {
+  private def buildArticleWeatherDataset(
+                                          base: DataFrame,
+                                          baseCols: Seq[Column],
+                                          delayCols: Seq[Column],
+                                          effectiveLags: Int
+                                        ): DataFrame = {
     val maxLag = math.min(effectiveLags - 1, 6) // Cap à lag6
 
-
     var df = base.select((baseCols ++ delayCols :+ col("weather_origin") :+ col("weather_dest")): _*)
-
 
     // Boucle sur les 7 lags horaires (0 à 6)
     for (lag <- 0 to maxLag) {
       val origin = col("weather_origin").getItem(lag)
-      val dest = col("weather_dest").getItem(lag)
-
+      val dest   = col("weather_dest").getItem(lag)
 
       df = df
         // Origine : T, H, Ws, Wd, P
@@ -619,13 +710,12 @@ final class TrainRandomForest(
         .withColumn(s"Wo_Ws_lag$lag", origin.getField("WindSpeed"))
         .withColumn(s"Wo_Wd_lag$lag", origin.getField("WindDirection"))
         .withColumn(s"Wo_P_lag$lag", origin.getField("SeaLevelPressure"))
-        // Couverture nuageuse maximale (max des altitudes rapportées)
+        // Couverture nuageuse maximale (proxy via sky_num_layers)
         .withColumn(s"Wo_S_lag$lag", origin.getField("sky_num_layers"))
-        // Visibilité transformée en distance (assumer champ prétraité si besoin)
+        // Visibilité (champ prétraité dans WeatherRawToClean)
         .withColumn(s"Wo_visibility_lag$lag", origin.getField("Visibility"))
         // Di = score cumulé des phéno météo horaires
         .withColumn(s"Wo_Di_lag$lag", sumWeatherScores(origin))
-
 
         // Destination
         .withColumn(s"Wd_T_lag$lag", dest.getField("DryBulbFarenheit"))
@@ -638,18 +728,15 @@ final class TrainRandomForest(
         .withColumn(s"Wd_Di_lag$lag", sumWeatherScores(dest))
     }
 
-
     // Ajout des flags *_missing et remplacement des NULLs par valeur de repli (e.g. 0.0)
-    val vars = Seq("T", "H", "Ws", "Wd", "P", "S", "visibility", "Di")
+    val vars     = Seq("T", "H", "Ws", "Wd", "P", "S", "visibility", "Di")
     val features = vars.flatMap(v => (0 to maxLag).flatMap(lag => Seq(s"Wo_${v}_lag$lag", s"Wd_${v}_lag$lag")))
-
 
     features.foldLeft(df) { (acc, name) =>
       acc.withColumn(s"${name}_missing", when(col(name).isNull, 1.0).otherwise(0.0))
         .withColumn(name, coalesce(col(name), lit(0.0)))
     }
   }
-
 
   /**
    * Construit un score Di horaire (cf. article section 2.3) en sommant les scores
@@ -781,7 +868,7 @@ final class TrainRandomForest(
 
     val threshold = delayThresholdMinutes.toDouble
 
-    val isOnTime = col("ARR_DELAY_NEW") < threshold
+    val isOnTime     = col("ARR_DELAY_NEW") < threshold
     val positiveCond = positiveFilterForDataset(delayDatasetId, threshold)
 
     val positives = base.filter(positiveCond)
@@ -933,9 +1020,8 @@ final class TrainRandomForest(
     val sc = spark.sparkContext
     sc.setJobDescription("TrainRF: entraînement du Random Forest")
 
-    // On caste explicitement toutes les features en double. Les NaN éventuels
-    // (issus du remplissage des colonnes météo en mode with-weather) sont
-    // transmis tels quels au Random Forest, qui sait les gérer dans les splits.
+    // On caste explicitement toutes les features en double.
+    // Les NaN et Inf éventuels ont été neutralisés plus haut dans prepareBaseDataset.
     val casted = featureCols.foldLeft(trainDF) { (df, c) =>
       df.withColumn(c, col(c).cast("double"))
     }
@@ -945,23 +1031,28 @@ final class TrainRandomForest(
       .setOutputCol("features")
       .setHandleInvalid("keep")
 
-    // Hyperparamètres inspirés de l’article (section 4.3) :
-    // grand nombre d’arbres, profondeur raisonnable, sous-échantillonnage.
+    // Hyperparamètres inspirés de l’article (section 4.3), adaptés par mode :
+    //   – vecteur "compact" no-weather → modèle plus simple,
+    //   – vecteur riche en lags météo (with/article-weather) → davantage d’arbres / profondeur.
+    val hp = rfHyperParamsFor(mode)
+
     val rf = new RandomForestClassifier()
       .setLabelCol("label")
       .setFeaturesCol("features")
-      .setNumTrees(100)
-      .setMaxDepth(15)
-      .setFeatureSubsetStrategy("sqrt")
-      .setSubsamplingRate(0.7)
-      .setMinInstancesPerNode(50)
-      .setSeed(42L)
+      .setNumTrees(hp.numTrees)
+      .setMaxDepth(hp.maxDepth)
+      .setFeatureSubsetStrategy(hp.featureSubsetStrategy)
+      .setSubsamplingRate(hp.subsamplingRate)
+      .setMinInstancesPerNode(hp.minInstancesPerNode)
+      .setSeed(hp.seed)
 
     val pipeline = new Pipeline().setStages(Array(assembler, rf))
 
     log.info(
-      s"[Train] Démarrage RF : numTrees=${rf.getNumTrees}, " +
-        s"maxDepth=${rf.getMaxDepth}, subsamplingRate=${rf.getSubsamplingRate}"
+      s"[Train] Démarrage RF (featureSet=$normalizedFeatureSetId) : " +
+        s"numTrees=${hp.numTrees}, maxDepth=${hp.maxDepth}, " +
+        s"subsamplingRate=${hp.subsamplingRate}, minInstancesPerNode=${hp.minInstancesPerNode}, " +
+        s"featureSubsetStrategy=${hp.featureSubsetStrategy}"
     )
 
     val model = pipeline.fit(casted)
