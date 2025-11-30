@@ -46,7 +46,8 @@ export FP_U_WAREHOUSE="${FP_U_ROOT}/spark-warehouse"
 # ---------------------------------------------------------------------------
 # Ressources YARN (adaptées à ton cluster, valeurs conservées)
 # ---------------------------------------------------------------------------
-export FP_NUM_EXECUTORS="${FP_NUM_EXECUTORS:-11}"
+#export FP_NUM_EXECUTORS="${FP_NUM_EXECUTORS:-11}"
+export FP_NUM_EXECUTORS="${FP_NUM_EXECUTORS:-13}"
 export FP_EXEC_CORES="${FP_EXEC_CORES:-4}"
 export FP_EXEC_MEM="${FP_EXEC_MEM:-9g}"
 export FP_EXEC_OVERHEAD="${FP_EXEC_OVERHEAD:-1024}"   # en MB

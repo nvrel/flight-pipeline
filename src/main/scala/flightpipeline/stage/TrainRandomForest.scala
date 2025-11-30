@@ -270,6 +270,9 @@ final class TrainRandomForest(
       s"RandomForest training (Th=${delayThresholdMinutes}m, dataset=$delayDatasetId, feature-set=$normalizedFeatureSetId)"
     )
 
+    // Répertoire HDFS pour les checkpoints (même racine que outRoot)
+    sc.setCheckpointDir(s"$outRoot/checkpoints_rf")
+
     // Mesure des durées de run (article section 4.3 – coût d’apprentissage).
     val wallStartNs = System.nanoTime()
 
@@ -324,13 +327,17 @@ final class TrainRandomForest(
       //   – under-sampling pour équilibrer positifs / vols à l’heure,
       //   – split 75 % / 25 % dans chaque classe.
       // ------------------------------------------------------------------
-      val (trainDF, testDF, nTrainPos, nTrainNeg, nTestPos, nTestNeg) =
+      val (uncheckpointedTrainDF, uncheckpointedTestDF, nTrainPos, nTrainNeg, nTestPos, nTestNeg) =
         buildBalancedTrainTest(prepared)
 
       val nTrain = nTrainPos + nTrainNeg
       val nTest  = nTestPos + nTestNeg
-      log.info(s"[Train] Split train/test équilibré : train=$nTrain lignes, test=$nTest lignes")
+      log.info(s"[Train] Split train/test équilibré (avant checkpoint) : train=$nTrain lignes, test=$nTest lignes")
 
+      // === NOUVEAU : snapshot déterministe de train/test ===
+      val trainDF = uncheckpointedTrainDF.checkpoint(eager = true)
+      val testDF  = uncheckpointedTestDF.checkpoint(eager = true)
+      log.info("[Train] Checkpoint train/test effectué")
       trainDF.persist(StorageLevel.MEMORY_AND_DISK)
       testDF.persist(StorageLevel.MEMORY_AND_DISK)
 
