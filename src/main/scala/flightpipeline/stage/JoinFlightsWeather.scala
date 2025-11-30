@@ -40,7 +40,8 @@ final class JoinFlightsWeather(
                                 outIntermediate: String,
                                 outFlat: String,
                                 windowHours: Int,
-                                lags: Int
+                                lags: Int,
+                                sampleMonth: Option[String]
                               )
 {
   private val log = LoggerFactory.getLogger(getClass)
@@ -211,6 +212,8 @@ final class JoinFlightsWeather(
       )
 
       val optional = Seq(
+        "CANCELLED",
+        "DIVERTED",
         "OP_UNIQUE_CARRIER",
         "OP_CARRIER",
         "OP_CARRIER_FL_NUM",
@@ -219,6 +222,30 @@ final class JoinFlightsWeather(
 
       val present  = flightsSrc.columns.toSet
       val keepCols = mustHave ++ optional.filter(present.contains)
+
+      // 👇 Filtrage éventuel sur un mois YYYYMM
+      val flightsFiltered = sampleMonth match {
+        case Some(yyyymm) =>
+          log.info(s"[Join] Filtrage des vols sur sampleMonth=$yyyymm (FL_DATE en yyyyMM)")
+          val df = flightsSrc
+            .filter(date_format(col("FL_DATE"), "yyyyMM") === lit(yyyymm))
+
+          val cnt = df.count()
+          val db  = df
+            .select(
+              min(col("FL_DATE")).as("min_date"),
+              max(col("FL_DATE")).as("max_date")
+            )
+            .first()
+
+          log.info(
+            s"[Join] Après filtre mois $yyyymm : rows=$cnt, FL_DATE=[${db.getAs[java.sql.Date]("min_date")} .. ${db.getAs[java.sql.Date]("max_date")}]"
+          )
+          df
+
+        case None =>
+          flightsSrc
+      }
 
       val flightsLocal = flightsSrc
         .select(keepCols.map(col): _*)

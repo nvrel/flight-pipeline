@@ -27,14 +27,14 @@
         </Logger>
 
         <!-- Baisser le bruit des libs -->
-        <Logger name="org.apache.spark" level="warn" additivity="false">
+        <Logger name="org.apache.spark" level="error" additivity="false">
             <AppenderRef ref="Console"/>
             <AppenderRef ref="RollingFile"/>
         </Logger>
-        <Logger name="org.sparkproject" level="warn"/>
-        <Logger name="org.apache.hadoop" level="warn"/>
-        <Logger name="org.apache.parquet" level="warn"/>
-        <Logger name="akka" level="warn"/>
+        <Logger name="org.sparkproject" level="error"/>
+        <Logger name="org.apache.hadoop" level="error"/>
+        <Logger name="org.apache.parquet" level="error"/>
+        <Logger name="akka" level="error"/>
 
         <!-- Root : WARN -->
         <Root level="warn">

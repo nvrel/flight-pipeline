@@ -40,8 +40,7 @@ final case class Args(
 object Args {
 
   // Format YYYYMM utilisé pour restreindre le périmètre à un mois donné.
-  private val MonthPattern = "^[0-9]{6}$".r
-
+  private val MonthPattern = "^([0-9]{6})$".r
   /**
    * Parsing très simple de la ligne de commande sous la forme :
    *   --clé valeur
@@ -81,7 +80,10 @@ object Args {
 
     val mode = cli.getOrElse("mode", defaults.mode)
 
-    val sampleMonth: Option[String] = cli.get("sample-month") match {
+    // -----------------------------
+    // Filtre éventuel sur un mois (YYYYMM)
+    // -----------------------------
+    val sampleMonth: Option[String] = cli.get("sample-month").map(_.trim) match {
       case None =>
         defaults.sampleMonth
 
@@ -94,6 +96,21 @@ object Args {
             s"Valeur reçue : $other"
         )
     }
+    /*
+    val sampleMonth: Option[String] = cli.get("sample-month").map(_.trim) match {
+      case None =>
+        defaults.sampleMonth
+
+      case Some(MonthPattern(m)) =>
+        Some(m)
+
+      case Some(other) =>
+        throw new IllegalArgumentException(
+          s"--sample-month doit être au format YYYYMM (ex : 201205). " +
+            s"Valeur reçue : $other"
+        )
+    }
+  */
 
     // -----------------------------
     // Dataset de retard ciblé (D1..D4)

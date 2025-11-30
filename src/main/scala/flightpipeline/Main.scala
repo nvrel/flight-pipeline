@@ -75,6 +75,8 @@ object Main {
       .appName("flight-pipeline")
       .getOrCreate()
 
+    spark.sparkContext.setLogLevel("ERROR")
+
     // Libellé lisible de l’étendue temporelle utilisée (ALL ou YYYYMM)
     val sampleLabel = args.sampleMonth.getOrElse("ALL")
 
@@ -206,7 +208,8 @@ object Main {
         outIntermediate      = paths.joinIntermediateOut,
         outFlat              = paths.joinFlatOut(args.lags),
         windowHours          = args.windowHours,
-        lags                 = args.lags
+        lags                 = args.lags,
+        sampleMonth          = args.sampleMonth
       )      // Le résultat est écrit en Delta, pas besoin de conserver la DataFrame ici
       joiner.run()
 
