@@ -39,3 +39,4 @@ spark-warehouse/
 .DS_Store
 Thumbs.db
 .git.BAK*
+test-clone/
