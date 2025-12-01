@@ -1,4 +1,0 @@
-dataset,rows,non_null_CRS_DEP_TIMESTAMP,non_null_ORIGIN_AIRPORT_ID,non_null_DEST_AIRPORT_ID,distinct_FL_DATE,distinct_ORIGIN_AIRPORT_ID,distinct_DEST_AIRPORT_ID,non_null_timestamp,non_null_AirportId,distinct_AirportId,distinct_date,distinct_WBAN
-airport_timezone_clean,305,,,,,,,,,311,,300
-flight_clean,17943069,17943068,17943069,17943069,1098,333,331,,,,,
-weather_clean,2065588,,,,,,,2065588,2065588,272,244,
