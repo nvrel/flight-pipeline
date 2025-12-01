@@ -182,6 +182,36 @@ final class JoinFlightsWeather(
       airportTzPersisted = Some(airportTz)
 
       // ------------------------------------------------------------------
+      // 0bis) Bornes temporelles de la météo en UTC
+      //
+      // On calcule min/max des timestamps météo disponibles (w_ts_utc)
+      // pour filtrer ensuite les vols qui sortent complètement de cette
+      // période. Cela évite de faire passer des vols "hors météo" dans
+      // les grosses jointures non-équi.
+      // ------------------------------------------------------------------
+      sc.setJobDescription("Calcul des bornes temporelles de la météo (UTC)")
+
+      val weatherBoundsRow = spark.read
+        .format("delta")
+        .load(weatherCleanPath)
+        .join(airportTz, Seq("AirportId"), "left")
+        .withColumn(
+          "w_ts_utc",
+          expr("timestampadd(HOUR, -coalesce(TimeZone, 0), timestamp)")
+        )
+        .agg(
+          min(col("w_ts_utc")).as("min_w"),
+          max(col("w_ts_utc")).as("max_w")
+        )
+        .first()
+
+      val minWeatherTsUtc = weatherBoundsRow.getAs[java.sql.Timestamp]("min_w")
+      val maxWeatherTsUtc = weatherBoundsRow.getAs[java.sql.Timestamp]("max_w")
+
+      log.info(s"[Join] Fenêtre météo disponible (UTC) = [$minWeatherTsUtc .. $maxWeatherTsUtc]")
+
+
+      // ------------------------------------------------------------------
       // 1) Vols : colonnes nécessaires et timestamps
       //
       // Référence article : définition de Fs = <Ao, Ad, tsd, tsa>
@@ -223,7 +253,7 @@ final class JoinFlightsWeather(
       val present  = flightsSrc.columns.toSet
       val keepCols = mustHave ++ optional.filter(present.contains)
 
-      // 👇 Filtrage éventuel sur un mois YYYYMM
+      // Filtrage éventuel sur un mois YYYYMM
       val flightsFiltered = sampleMonth match {
         case Some(yyyymm) =>
           log.info(s"[Join] Filtrage des vols sur sampleMonth=$yyyymm (FL_DATE en yyyyMM)")
@@ -247,7 +277,7 @@ final class JoinFlightsWeather(
           flightsSrc
       }
 
-      val flightsLocal = flightsSrc
+      val flightsLocal = flightsFiltered
         .select(keepCols.map(col): _*)
 
       // Conversion des horaires planifiés en UTC à partir du fuseau de l'aéroport d'origine.
@@ -255,34 +285,44 @@ final class JoinFlightsWeather(
       //   - CRS_DEP_TIMESTAMP est en heure locale origine (comme dans l’article pour tsd),
       //   - on le passe en UTC via TimeZone,
       //   - puis on ajoute CRS_ELAPSED_TIME pour obtenir l’instant d’arrivée en UTC.
-      val flights = flightsLocal
+      // Conversion en UTC côté vols
+      val flightsUtc = flightsLocal
         .join(
           airportTz.withColumnRenamed("AirportId", "ORIGIN_AIRPORT_ID"),
           Seq("ORIGIN_AIRPORT_ID"),
           "left"
         )
         .withColumnRenamed("TimeZone", "TZ_ORIGIN")
-        // tsd_utc = tsd_local - TimeZone (ex : TimeZone = -5 → +5h pour aller en UTC)
         .withColumn(
           "CRS_DEP_TIMESTAMP",
           expr("timestampadd(HOUR, -coalesce(TZ_ORIGIN, 0), CRS_DEP_TIMESTAMP)")
         )
-        // tsa_utc = tsd_utc + durée planifiée (en secondes)
         .withColumn(
           "CRS_ARR_TIMESTAMP",
           expr("timestampadd(SECOND, coalesce(CRS_ELAPSED_TIME, 0) * 60, CRS_DEP_TIMESTAMP)")
         )
         .drop("TZ_ORIGIN")
+
+      // Filtrage des vols à la fenêtre météo disponible
+      // On ne garde que les vols dont la fenêtre [dep - H, arr] est
+      // compatible avec [minWeatherTsUtc, maxWeatherTsUtc + 1h].
+      val minAllowedDep = new java.sql.Timestamp(
+        minWeatherTsUtc.getTime + windowHours.toLong * 3600L * 1000L
+      )
+      val maxAllowedArr = new java.sql.Timestamp(
+        maxWeatherTsUtc.getTime + 1L * 3600L * 1000L
+      )
+
+      val flights = flightsUtc
+        .filter(col("CRS_DEP_TIMESTAMP") >= lit(minAllowedDep))
+        .filter(col("CRS_ARR_TIMESTAMP") <= lit(maxAllowedArr))
         .withColumn("flight_id", monotonically_increasing_id())
         .repartition(col("ORIGIN_AIRPORT_ID"))
         .persist(StorageLevel.MEMORY_AND_DISK)
 
       flightsPersisted = Some(flights)
-      log.info(s"[Join] Colonnes vols conservées = ${keepCols.mkString(",")}")
 
-      // Bornes temporelles utiles pour la météo :
-      // le jeu météo couvre plusieurs années, mais seule la période
-      // où des vols existent est pertinente pour le projet.
+      // Bornes temporelles utiles pour la météo (sur les vols déjà filtrés)
       sc.setJobDescription("Calcul des bornes temporelles pour le filtrage météo")
 
       val bounds = flights
@@ -298,15 +338,11 @@ final class JoinFlightsWeather(
       val minCut = new java.sql.Timestamp(
         minDep.getTime - windowHours.toLong * 3600L * 1000L
       )
-      // Marge de +1h après l’arrivée planifiée pour couvrir les lags
-      // à destination, conformément à l’esprit de la fenêtre temporelle
-      // de l’article (section 2.2).
       val maxCut = new java.sql.Timestamp(
         maxArr.getTime + 1L * 3600L * 1000L
       )
 
-      log.info(s"[Join] Fenêtre temporelle météo = [$minCut .. $maxCut]")
-
+      log.info(s"[Join] Fenêtre temporelle météo utilisée = [$minCut .. $maxCut]")
       // ------------------------------------------------------------------
       // 2) Météo : filtrage temporel et sélection de features
       //
@@ -375,6 +411,7 @@ final class JoinFlightsWeather(
         Window.partitionBy(col("flight_id")).orderBy(col("orig_w_ts").desc)
 
       val origRanked = joinOrig
+        .filter(col("orig_w_ts").isNotNull)
         .withColumn("rk", row_number().over(wDescOrig))
         .filter(col("rk") <= effectiveLags)
         .drop("rk")
@@ -422,6 +459,7 @@ final class JoinFlightsWeather(
         Window.partitionBy(col("flight_id")).orderBy(col("dest_w_ts").desc)
 
       val destRanked = joinDest
+        .filter(col("dest_w_ts").isNotNull)
         .withColumn("rk", row_number().over(wDescDest))
         .filter(col("rk") <= effectiveLags)
         .drop("rk")
