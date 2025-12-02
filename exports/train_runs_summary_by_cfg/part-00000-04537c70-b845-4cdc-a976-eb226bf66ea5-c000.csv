@@ -1,2 +1,0 @@
-location,dataset_id,delay_threshold_min,lags,n_runs,mean_n_train,mean_n_test,Acc,Reco,Recd,std_Acc,std_Reco,std_Recd,Acc_pct,Reco_pct,Recd_pct
-local,D2,60,7,3,54995.0,18391.0,0.7737117793123449,0.7580002896032436,0.7894660423245853,0.06069355296556424,0.06556194256267137,0.055812549153226004,77.37,75.8,78.95

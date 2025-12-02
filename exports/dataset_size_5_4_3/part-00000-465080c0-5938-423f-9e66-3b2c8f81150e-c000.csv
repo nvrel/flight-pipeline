@@ -1,3 +1,0 @@
-Dataset,Nombre_de_vols,Commentaire
-Vols seuls (baseline = flight_clean),17943069,Tous les vols nettoyés 2012–2014
-Vols + météo (après filtrage),3841678,"21.4 % des vols de base, avec au moins une obs. météo à l’origine ou à la destination"
