@@ -1,0 +1,3 @@
+type_vol,nombre,pct_du_join,pct_de_flight_clean
+météo origine + destination,3841678,100.0,21.410372996949405
+aucune météo (vols filtrés avant la jointure),14101391,0.0,78.5896270030506

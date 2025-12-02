@@ -49,7 +49,8 @@ final class TrainRandomForest(
                                lags: Int,
                                delayThresholdMinutes: Int = 60,
                                delayDatasetId: String = "D2",          // D1..D4 / ALL : jeux de retards (article section 4.2)
-                               featureSetId: String = "with-weather"   // "with-weather" / "no-weather" / "article-weather"
+                               featureSetId: String = "with-weather", // "with-weather" / "no-weather" / "article-weather"
+                               sampleMonth: Option[String] = None
                              ) {
 
   private val log = LoggerFactory.getLogger(getClass)
@@ -292,11 +293,34 @@ final class TrainRandomForest(
       // 1. Lecture de la table join_intermediate (résultat de JoinFlightsWeather)
       // ------------------------------------------------------------------
       log.info(s"[Train] Lecture de la table Delta join_intermediate depuis $joinIntermediatePath")
-      val joined = spark.read.format("delta").load(joinIntermediatePath)
+      val joinedRaw = spark.read.format("delta").load(joinIntermediatePath)
+
+      // Si un mois d'échantillon est fourni (YYYYMM), on filtre les vols
+      // sur ce mois-là, en se basant sur FL_DATE.
+      val joined = sampleMonth match {
+        case Some(yyyymm) if yyyymm.matches("\\d{6}") =>
+          val y = yyyymm.substring(0, 4).toInt
+          val m = yyyymm.substring(4, 6).toInt
+
+          log.info(s"[Train] Filtrage des vols sur le mois $yyyymm (FL_DATE = $y-$m)")
+          joinedRaw.filter(
+            org.apache.spark.sql.functions.year(col("FL_DATE")) === lit(y) &&
+              org.apache.spark.sql.functions.month(col("FL_DATE")) === lit(m)
+          )
+
+        case Some(other) =>
+          log.warn(
+            s"[Train] sampleMonth fourni mais au format inattendu ('$other'), " +
+              s"aucun filtrage temporel appliqué en training."
+          )
+          joinedRaw
+
+        case None =>
+          joinedRaw
+      }
 
       val nJoined = joined.count()
       log.info(s"[Train] Dataset join_intermediate : $nJoined lignes, ${joined.columns.length} colonnes")
-
       // Bornes de période FL_DATE, utilisées pour documenter le run dans TrainRunLogger.
       val dateBounds = joined
         .agg(

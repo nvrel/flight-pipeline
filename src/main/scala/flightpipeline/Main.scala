@@ -237,7 +237,8 @@ object Main {
         lags                  = args.lags,
         delayThresholdMinutes = args.delayThresholdMinutes,
         delayDatasetId        = args.delayDataset,
-        featureSetId          = args.featureSet
+        featureSetId          = args.featureSet,
+        sampleMonth           = args.sampleMonth
       )
 
       // run() retourne un DataFrame à une seule ligne avec les métriques test

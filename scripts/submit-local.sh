@@ -15,6 +15,7 @@ set -euo pipefail
 source "$(dirname "$0")/env-local.sh"
 
 # Valeurs par défaut si l'environnement ne les définit pas déjà
+DELAY_THRESHOLD_MIN="${FP_DELAY_THRESHOLD_MIN:-60}"
 : "${FP_OUT_ROOT:=out}"
 : "${FP_DELAY_DATASET:=D2}"         # D3 = bad-weather delays (article, section 4.2)
 : "${FP_FEATURE_SET:=with-weather}" # with-weather / no-weather
@@ -116,7 +117,7 @@ CLI_ARGS=(
   --airport "data/wban_airport_timezone.csv"
   --out "$FP_OUT_ROOT"
   --hours 12
-  --delay-threshold-min 60
+  --delay-threshold-min "$DELAY_THRESHOLD_MIN"
   --lags "$LAGS"
   --delay-dataset "$DELAY_DATASET"
   --feature-set "$FEATURE_SET"

@@ -23,7 +23,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Charge env-cluster (chemins HDFS/CephFS, ressources Yarn, etc.)
 source "${SCRIPT_DIR}/env-cluster.sh"
-
+DELAY_THRESHOLD_MIN="${FP_DELAY_THRESHOLD_MIN:-60}"
 # Jeux de retards / features par défaut (comme en local)
 : "${FP_DELAY_DATASET:=D2}"
 : "${FP_FEATURE_SET:=with-weather}"
@@ -75,7 +75,7 @@ CLI_ARGS=(
   --airport "$FP_U_AIRPORT"
   --out "$FP_U_OUT"
   --hours "$FP_HOURS"
-  --delay-threshold-min 60
+  --delay-threshold-min "$DELAY_THRESHOLD_MIN"
   --lags "$LAGS"
   --delay-dataset "$DELAY_DATASET"
   --feature-set "$FEATURE_SET"
