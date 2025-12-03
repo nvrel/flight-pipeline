@@ -493,6 +493,60 @@ final class TrainRandomForest(
     }
   }
 
+
+  /**
+   * Normalisation z-score des features météo pour le mode "article-weather".
+   *
+   * On standardise séparément chaque colonne numérique :
+   *    x_norm = (x - mean(x)) / std(x)
+   *
+   * Colonnes concernées :
+   *   - Wo_* et Wd_*  (indices météo par lag),
+   *   - dWo_* et dWd_* (dérivées horaires),
+   * en excluant explicitement les flags *_missing.
+   */
+  private def normalizeWeatherFeatures(df: DataFrame): DataFrame = {
+    // On ne touche qu’aux colonnes numériques météo (Wo_*, Wd_*, dWo_*, dWd_*)
+    val weatherCols: Seq[String] =
+      df.schema.fields.collect {
+        case f
+          if f.dataType.isInstanceOf[NumericType] &&
+            !f.name.endsWith("_missing") &&
+            (f.name.startsWith("Wo_") ||
+              f.name.startsWith("Wd_") ||
+              f.name.startsWith("dWo_") ||
+              f.name.startsWith("dWd_")) =>
+          f.name
+      }
+
+    if (weatherCols.isEmpty) {
+      log.warn("[Train] normalizeWeatherFeatures appelé sans colonnes météo numériques, aucun effet.")
+      df
+    } else {
+      log.info(s"[Train] Normalisation z-score sur ${weatherCols.size} colonnes météo (article-weather).")
+
+      // On calcule tous les couples (mean, std) en une seule agg
+      val aggExprs =
+        weatherCols.flatMap { c =>
+          Seq(
+            avg(col(c)).alias(s"${c}__mean"),
+            stddev_pop(col(c)).alias(s"${c}__std")
+          )
+        }
+
+      val statsRow = df.agg(aggExprs.head, aggExprs.tail: _*).head()
+
+      weatherCols.foldLeft(df) { (acc, c) =>
+        val meanVal   = Option(statsRow.getAs[Double](s"${c}__mean")).getOrElse(0.0)
+        val rawStdVal = Option(statsRow.getAs[Double](s"${c}__std")).getOrElse(0.0)
+        val stdVal =
+          if (rawStdVal == 0.0 || rawStdVal.isNaN) 1.0 else rawStdVal
+
+        acc.withColumn(c, (col(c) - lit(meanVal)) / lit(stdVal))
+      }
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Préparation des features (vol + météo Wo/Wd)
   // ---------------------------------------------------------------------------
@@ -630,25 +684,36 @@ final class TrainRandomForest(
       }
 
     val cleanedFinal =
-      floatDoubleCols.foldLeft(cleanedNoNulls) { (df, name) =>
-        df.withColumn(
-          name,
+      allNumericCols.foldLeft(cleanedNoNulls) { (acc, c) =>
+        acc.withColumn(
+          c,
           when(
-            isnan(col(name)) ||
-              col(name) === lit(Double.PositiveInfinity) ||
-              col(name) === lit(Double.NegativeInfinity),
+            col(c).isNull ||
+              col(c).isNaN ||
+              col(c) === Double.NegativeInfinity ||
+              col(c) === Double.PositiveInfinity,
             lit(0.0)
-          ).otherwise(col(name))
+          ).otherwise(col(c))
         )
       }
 
-    val nClean = cleanedFinal.count()
+    // --------------------------------------------------------------------
+    // Normalisation z-score des features météo pour le mode article-weather
+    // --------------------------------------------------------------------
+    val normalized: DataFrame =
+      if (normalizedFeatureSetId == "article-weather") {
+        normalizeWeatherFeatures(cleanedFinal)
+      } else {
+        cleanedFinal
+      }
+
+    val nClean = normalized.count()
     log.info(
-      s"[Train] Dataset apres preparation (featureSet=$normalizedFeatureSetId, includeWeather=${mode.includeWeather}) : " +
-        s"$nClean lignes, ${cleanedFinal.columns.length} colonnes"
+      s"[Train] Dataset après préparation (feature set = $normalizedFeatureSetId) : " +
+        s"$nClean lignes, ${normalized.columns.length} colonnes"
     )
 
-    cleanedFinal
+    normalized
   }
 
   /**
@@ -698,75 +763,115 @@ final class TrainRandomForest(
   }
 
   /**
-   * Mode "article-weather" aligné sur la section 2.3 de l’article (Belcastro et al., TIST 2016).
+   * Mode "article-weather" aligné sur la section 2.3 de l’article (Belcastro et al., TIST).
    *
    * Ce mode expose explicitement, pour chaque vol, les variables météo d’origine (Wo_*)
-   * et de destination (Wd_*) suivantes, pour les 7 heures précédant le vol (lags 0 à 6) :
-   * – T : température (Wo_T_lag0, ..., Wo_T_lag6)
-   * – H : humidité relative
-   * – Ws : vitesse du vent
-   * – Wd : direction du vent
-   * – P : pression au niveau de la mer
-   * – S : nébulosité maximale (couche la plus dense)
-   * – V : distance de visibilité
-   * – Di : indice de sévérité météo (score cumulé sur RA, TS, FG, BR, FZ, SN, SH, DZ)
+   * et de destination (Wd_*) suivantes, pour les heures précédant le vol (lags 0 à 6) :
+   *   – T  : température          → DryBulbFarenheit
+   *   – H  : humidité relative    → RelativeHumidity
+   *   – Ws : vitesse du vent      → WindSpeed
+   *   – Wd : direction du vent    → WindDirection
+   *   – P  : pression             → SeaLevelPressure
+   *   – S  : nébulosité           → sky_num_layers
+   *   – V  : visibilité           → Visibility (prétraitée dans WeatherRawToClean)
+   *   – Di : score de phénomènes  → somme wt_score_RA/TS/FG/BR/FZ/SN/SH/DZ
    *
-   * Contrairement à la version précédente qui faisait une moyenne glissante,
-   * on expose ici chaque observation horaire distinctement, comme suggéré dans l’article
-   * (mentions explicites de tests sur fenêtres 0 à 11 heures).
-   *
-   * Pour chaque feature, on ajoute :
-   * – un flag *_missing pour signaler l’absence de données (NULL),
-   * – une valeur imputée par défaut pour éviter les NULL dans le vecteur de features.
-   */
+   * On ajoute en plus des « dérivées » horaires dWo_/dWd_ qui mesurent la variation
+  * entre deux observations consécutives (t et t−1h), puis on normalisera ces features.
+    *
+  * Pour chaque feature Wo_/Wd_, on ajoute :
+    *   – un flag *_missing pour signaler l’absence de données,
+  *   – une valeur imputée (0.0) pour éviter les NULL dans le vecteur de features.
+  */
   private def buildArticleWeatherDataset(
                                           base: DataFrame,
                                           baseCols: Seq[Column],
                                           delayCols: Seq[Column],
                                           effectiveLags: Int
                                         ): DataFrame = {
-    val maxLag = math.min(effectiveLags - 1, 6) // Cap à lag6
+    // On limite la profondeur à 0..6 comme dans le rapport
+    val maxLag = math.min(effectiveLags - 1, 6)
 
-    var df = base.select((baseCols ++ delayCols :+ col("weather_origin") :+ col("weather_dest")): _*)
+    // On part du jeu de base + colonnes array weather_origin / weather_dest
+    var df = base.select(
+      (baseCols ++ delayCols :+ col("weather_origin") :+ col("weather_dest")): _*
+    )
 
-    // Boucle sur les 7 lags horaires (0 à 6)
+    // ----------------------------------------------------------------------
+    // 1) Dépliage des observations Wo/Wd : T, H, Ws, Wd, P, S, visibility, Di
+    // ----------------------------------------------------------------------
     for (lag <- 0 to maxLag) {
       val origin = col("weather_origin").getItem(lag)
       val dest   = col("weather_dest").getItem(lag)
 
       df = df
-        // Origine : T, H, Ws, Wd, P
-        .withColumn(s"Wo_T_lag$lag", origin.getField("DryBulbFarenheit"))
-        .withColumn(s"Wo_H_lag$lag", origin.getField("RelativeHumidity"))
+        // Origine
+        .withColumn(s"Wo_T_lag$lag",  origin.getField("DryBulbFarenheit"))
+        .withColumn(s"Wo_H_lag$lag",  origin.getField("RelativeHumidity"))
         .withColumn(s"Wo_Ws_lag$lag", origin.getField("WindSpeed"))
         .withColumn(s"Wo_Wd_lag$lag", origin.getField("WindDirection"))
-        .withColumn(s"Wo_P_lag$lag", origin.getField("SeaLevelPressure"))
-        // Couverture nuageuse maximale (proxy via sky_num_layers)
-        .withColumn(s"Wo_S_lag$lag", origin.getField("sky_num_layers"))
-        // Visibilité (champ prétraité dans WeatherRawToClean)
+        .withColumn(s"Wo_P_lag$lag",  origin.getField("SeaLevelPressure"))
+        .withColumn(s"Wo_S_lag$lag",  origin.getField("sky_num_layers"))
         .withColumn(s"Wo_visibility_lag$lag", origin.getField("Visibility"))
-        // Di = score cumulé des phéno météo horaires
         .withColumn(s"Wo_Di_lag$lag", sumWeatherScores(origin))
-
         // Destination
-        .withColumn(s"Wd_T_lag$lag", dest.getField("DryBulbFarenheit"))
-        .withColumn(s"Wd_H_lag$lag", dest.getField("RelativeHumidity"))
+        .withColumn(s"Wd_T_lag$lag",  dest.getField("DryBulbFarenheit"))
+        .withColumn(s"Wd_H_lag$lag",  dest.getField("RelativeHumidity"))
         .withColumn(s"Wd_Ws_lag$lag", dest.getField("WindSpeed"))
         .withColumn(s"Wd_Wd_lag$lag", dest.getField("WindDirection"))
-        .withColumn(s"Wd_P_lag$lag", dest.getField("SeaLevelPressure"))
-        .withColumn(s"Wd_S_lag$lag", dest.getField("sky_num_layers"))
+        .withColumn(s"Wd_P_lag$lag",  dest.getField("SeaLevelPressure"))
+        .withColumn(s"Wd_S_lag$lag",  dest.getField("sky_num_layers"))
         .withColumn(s"Wd_visibility_lag$lag", dest.getField("Visibility"))
         .withColumn(s"Wd_Di_lag$lag", sumWeatherScores(dest))
     }
 
-    // Ajout des flags *_missing et remplacement des NULLs par valeur de repli (e.g. 0.0)
-    val vars     = Seq("T", "H", "Ws", "Wd", "P", "S", "visibility", "Di")
-    val features = vars.flatMap(v => (0 to maxLag).flatMap(lag => Seq(s"Wo_${v}_lag$lag", s"Wd_${v}_lag$lag")))
+    // ----------------------------------------------------------------------
+    // 2) Flags *_missing + imputation 0.0 sur les Wo_*/Wd_ de base
+    // ----------------------------------------------------------------------
+    val vars = Seq("T", "H", "Ws", "Wd", "P", "S", "visibility", "Di")
 
-    features.foldLeft(df) { (acc, name) =>
-      acc.withColumn(s"${name}_missing", when(col(name).isNull, 1.0).otherwise(0.0))
-        .withColumn(name, coalesce(col(name), lit(0.0)))
+    val baseFeatureNames: Seq[String] =
+      vars.flatMap { v =>
+        (0 to maxLag).flatMap { lag =>
+          Seq(s"Wo_${v}_lag$lag", s"Wd_${v}_lag$lag")
+        }
+      }
+
+    val dfWithFlags =
+      baseFeatureNames.foldLeft(df) { (acc, name) =>
+        acc.withColumn(s"${name}_missing", when(col(name).isNull, 1.0).otherwise(0.0))
+          .withColumn(name, coalesce(col(name), lit(0.0)))
+      }
+
+    // ----------------------------------------------------------------------
+    // 3) Dérivées temporelles des variables météo (variation horaire)
+    //
+    // dWo_<var>_lagk = Wo_<var>_lag(k-1) - Wo_<var>_lagk   (k >= 1)
+    // dWd_<var>_lagk = Wd_<var>_lag(k-1) - Wd_<var>_lagk
+    //
+    // On les nomme dWo_*/dWd_* pour qu’elles soient clairement identifiables,
+    // mais elles ne portent pas de *_missing : elles sont dérivées des valeurs
+    // déjà imputées ci‑dessus.
+    // ----------------------------------------------------------------------
+    var dfWithDerivatives = dfWithFlags
+
+    for (lag <- 1 to maxLag) {
+      val prevLag = lag - 1
+      vars.foreach { v =>
+        dfWithDerivatives =
+          dfWithDerivatives
+            .withColumn(
+              s"dWo_${v}_lag$lag",
+              col(s"Wo_${v}_lag$prevLag") - col(s"Wo_${v}_lag$lag")
+            )
+            .withColumn(
+              s"dWd_${v}_lag$lag",
+              col(s"Wd_${v}_lag$prevLag") - col(s"Wd_${v}_lag$lag")
+            )
+      }
     }
+
+    dfWithDerivatives
   }
 
   /**

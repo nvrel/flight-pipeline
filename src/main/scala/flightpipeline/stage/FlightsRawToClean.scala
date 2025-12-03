@@ -38,10 +38,19 @@ final class FlightsRawToClean(spark: SparkSession, flightsGlob: String, out: Str
       .withColumn("DEST_AIRPORT_ID",   col("DEST_AIRPORT_ID").cast(ShortType))
       .withColumn("ARR_DELAY_NEW",     col("ARR_DELAY_NEW").cast(FloatType))
       .withColumn("CRS_ELAPSED_TIME",  col("CRS_ELAPSED_TIME").cast(FloatType))
-      .withColumn("HAS_WEATHER_DELAY", col("WEATHER_DELAY").isNotNull)
-      .withColumn("WEATHER_DELAY",     coalesce(col("WEATHER_DELAY").cast(FloatType), lit(0.0f)))
-      .withColumn("HAS_NAS_DELAY",     col("NAS_DELAY").isNotNull)
-      .withColumn("NAS_DELAY",         coalesce(col("NAS_DELAY").cast(FloatType), lit(0.0f)))
+      // 1) Cast brut
+      .withColumn("WEATHER_DELAY", col("WEATHER_DELAY").cast(FloatType))
+      .withColumn("NAS_DELAY",     col("NAS_DELAY").cast(FloatType))
+
+      // 2) Flags "vrais" : retard strictement positif
+      .withColumn("HAS_WEATHER_DELAY", col("WEATHER_DELAY") > 0.0f)
+      .withColumn("HAS_NAS_DELAY",     col("NAS_DELAY") > 0.0f)
+
+      // 3) Remplissage des nulls par 0.0
+      .withColumn("WEATHER_DELAY", coalesce(col("WEATHER_DELAY"), lit(0.0f)))
+      .withColumn("NAS_DELAY",     coalesce(col("NAS_DELAY"),     lit(0.0f)))
+
+      // 4) Cast final
       .withColumn("CRS_DEP_TIME_STR",  lpad(col("CRS_DEP_TIME").cast(StringType), 4, "0"))
       .withColumn("CRS_DEP_TIMESTAMP", to_timestamp(concat(col("FL_DATE"), col("CRS_DEP_TIME_STR")), "yyyy-MM-ddHHmm"))
       .drop("CRS_DEP_TIME_STR","CANCELLED","DIVERTED")
