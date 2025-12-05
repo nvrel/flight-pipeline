@@ -563,7 +563,9 @@ final class TrainRandomForest(
    * Lorsque le mode courant est "no-weather", cette méthode construit un
    * jeu de features "baseline" sans météo, comme dans les expériences
    * où l'article compare avec / sans variables météo.
-   *
+   * normalisation des features météorologiques et gestion explicite des 
+   * valeurs manquantes (flags *_missing en mode « article-weather »), 
+   * traitement des NULL et NaN numériques. 
    * Lorsque normalizedFeatureSetId = "article-weather", seules les
    * variables météo correspondant à T, H, Ws, Wd, P, S et Di sont
    * conservées via des indices Wo/Wd synthétiques (cf. section 2.3).

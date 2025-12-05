@@ -16,7 +16,7 @@ final class WeatherRawToClean(
                                spark: SparkSession,
                                weatherDir: String,
                                airportCsv: String,
-                               flightCleanPath: String,    // <-- NOUVEAU : chemin Delta du flight_clean
+                               flightCleanPath: String, 
                                weatherOut: String,
                                airportOut: String
                              ) {
@@ -101,7 +101,7 @@ final class WeatherRawToClean(
       .withColumn("WeatherType",  col("WeatherType"))
       .drop("date","time")
 
-    // 6) RESTREINDRE ICI la météo aux WBAN autorisés
+    // 6) RESTREINDRE la météo aux WBAN autorisés
     val dfRestricted = df1.join(wbanAllowed, Seq("WBAN"), "inner")
 
     // 7) Features SkyCondition (couches, altitudes min/max/moy, CB/TCU + indicateurs nuageux)
